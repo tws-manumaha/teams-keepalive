@@ -13,6 +13,7 @@ It combines two non-disruptive signals:
 Runs quietly in the system tray.  Right-click the icon to:
   - Toggle the keep-alive on / off
   - Cycle the activity interval (2 / 3 / 4 / 5 / 10 minutes)
+  - Open a GUI to schedule an automatic stop time (e.g. 17:00 / 5 PM)
   - Quit the app
 
 On Windows, input simulation uses ctypes (Win32 API) directly — no
@@ -32,6 +33,7 @@ import platform
 import threading
 import time
 import sys
+import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -39,6 +41,7 @@ from logging.handlers import RotatingFileHandler
 # pystray  – system-tray icon and menu
 # Pillow   – required by pystray for the icon image
 # pynput   – only needed on macOS/Linux (Windows uses ctypes)
+# tkinter  – standard library, used for the schedule GUI
 
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
@@ -51,35 +54,24 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    # Virtual-key code for F15
     VK_F15 = 0x7E
-
-    # keybd_event flags
     KEYEVENTF_KEYUP = 0x0002
-
-    # mouse_event flags
-    MOUSEEVENTF_MOVE = 0x0001
 
     def press_f15():
         """Press and release F15 using the Win32 API."""
-        ctypes.windll.user32.keybd_event(VK_F15, 0, 0, 0)            # key down
-        ctypes.windll.user32.keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0)  # key up
+        ctypes.windll.user32.keybd_event(VK_F15, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0)
 
     def jiggle_mouse():
         """Move the mouse 2px and back using the Win32 API."""
-        # Read current cursor position
         point = ctypes.wintypes.POINT()
         ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
         orig_x, orig_y = point.x, point.y
-
-        # Move 2px right-down
         ctypes.windll.user32.SetCursorPos(orig_x + 2, orig_y + 2)
         time.sleep(0.05)
-        # Move back
         ctypes.windll.user32.SetCursorPos(orig_x, orig_y)
 
 else:
-    # macOS / Linux fallback using pynput
     from pynput.keyboard import Controller as KeyboardController, Key as KbdKey
     from pynput.mouse import Controller as MouseController
 
@@ -101,7 +93,6 @@ else:
 
 APP_NAME = "Teams Keep-Alive"
 
-# Interval choices in seconds (cycled by clicking the Interval menu item)
 INTERVALS = [120, 180, 240, 300, 600]  # 2, 3, 4, 5, 10 minutes
 DEFAULT_INTERVAL_IDX = 2  # 240 seconds = 4 minutes
 
@@ -140,6 +131,10 @@ class KeepAlive:
         self._thread = None
         self._stop_event = threading.Event()
         self._ping_count = 0
+        # Scheduler
+        self.stop_time = None       # datetime.time or None
+        self._scheduler_thread = None
+        self._scheduler_stop = threading.Event()
 
     def start(self):
         if self.running:
@@ -166,7 +161,6 @@ class KeepAlive:
             self.start()
 
     def cycle_interval(self):
-        """Advance to the next interval in the list and restart if running."""
         self.interval_idx = (self.interval_idx + 1) % len(INTERVALS)
         self.interval = INTERVALS[self.interval_idx]
         log.info("Interval cycled to %ss (%s min)", self.interval, self.interval // 60)
@@ -174,22 +168,67 @@ class KeepAlive:
             self.stop()
             self.start()
 
-    def _simulate_activity(self):
-        """Press F15 (harmless) and jiggle the mouse by 2 px."""
-        self._ping_count += 1
+    # -- scheduler ---------------------------------------------------------
 
+    def schedule_stop(self, stop_time):
+        """Schedule the keep-alive to stop at a specific time of day.
+
+        Args:
+            stop_time: a datetime.time object (e.g. time(17, 0) for 5 PM).
+        """
+        self.stop_time = stop_time
+        self._scheduler_stop.set()  # stop any existing scheduler
+        self._scheduler_stop = threading.Event()
+
+        # Compute seconds until the target time
+        now = datetime.datetime.now()
+        target = datetime.datetime.combine(now.date(), stop_time)
+        if target <= now:
+            target += datetime.timedelta(days=1)  # schedule for tomorrow
+        wait_seconds = (target - now).total_seconds()
+
+        log.info("Auto-stop scheduled for %s (in %.0f seconds / %.1f hours)",
+                 target.strftime("%Y-%m-%d %H:%M"), wait_seconds, wait_seconds / 3600)
+
+        def _scheduler_loop():
+            # Sleep in small increments so we can be cancelled
+            elapsed = 0
+            while elapsed < wait_seconds:
+                if self._scheduler_stop.wait(1):
+                    return  # cancelled
+                elapsed += 1
+
+            if self._scheduler_stop.is_set():
+                return  # was cancelled before reaching target
+
+            log.info("Auto-stop time reached (%s) — stopping keep-alive",
+                     target.strftime("%H:%M"))
+            if self.running:
+                self.stop()
+            self.stop_time = None
+
+        self._scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+        self._scheduler_thread.start()
+
+    def cancel_stop_schedule(self):
+        self._scheduler_stop.set()
+        self.stop_time = None
+        log.info("Auto-stop schedule cancelled")
+
+    # -- activity simulation -----------------------------------------------
+
+    def _simulate_activity(self):
+        self._ping_count += 1
         try:
             press_f15()
         except Exception as e:
             log.error("F15 keypress FAILED: %s", e)
             return
-
         try:
             jiggle_mouse()
         except Exception as e:
             log.error("Mouse jiggle FAILED: %s", e)
             return
-
         log.info("Activity ping #%d — F15 pressed, mouse jiggled (interval: %ss)",
                  self._ping_count, self.interval)
 
@@ -205,7 +244,6 @@ class KeepAlive:
 # --- Tray icon -------------------------------------------------------------
 
 def create_icon_image(active: bool) -> Image.Image:
-    """Draw a simple tray icon: green circle when active, grey when idle."""
     img = Image.new("RGB", (64, 64), (30, 30, 30))
     draw = ImageDraw.Draw(img)
     colour = (76, 175, 80) if active else (120, 120, 120)
@@ -214,6 +252,124 @@ def create_icon_image(active: bool) -> Image.Image:
     draw.line((28, 32, 40, 20), fill=(255, 255, 255), width=3)
     draw.line((28, 32, 40, 44), fill=(255, 255, 255), width=3)
     return img
+
+
+# --- Schedule GUI (runs in a separate thread) -------------------------------
+
+def show_schedule_dialog(keepalive, on_done=None):
+    """Open a small tkinter GUI to set/clear the auto-stop time.
+
+    Runs in a separate thread so it doesn't block pystray's event loop.
+    """
+
+    def _run():
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception:
+            log.error("tkinter is not available on this system")
+            return
+
+        root = tk.Tk()
+        root.title("Teams Keep-Alive — Schedule")
+        root.geometry("340x230")
+        root.resizable(False, False)
+
+        # --- UI ---
+        frame = ttk.Frame(root, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Auto-Stop Time", font=("Segoe UI", 14, "bold")).pack(pady=(0, 4))
+        ttk.Label(frame, text="The keep-alive will stop itself at this time.",
+                  font=("Segoe UI", 9)).pack(pady=(0, 12))
+
+        # Time spinboxes
+        time_frame = ttk.Frame(frame)
+        time_frame.pack(pady=(0, 8))
+
+        hour_var = tk.StringVar(value="17")
+        min_var = tk.StringVar(value="00")
+
+        # Hour spinbox (12-hour + AM/PM for user-friendliness)
+        ampm_var = tk.StringVar(value="PM")
+
+        ttk.Label(time_frame, text="Time:  ").pack(side="left")
+        hour_sb = ttk.Spinbox(time_frame, from_=1, to=12, width=4,
+                              textvariable=hour_var, font=("Segoe UI", 11))
+        hour_sb.pack(side="left")
+        ttk.Label(time_frame, text=" : ").pack(side="left")
+        min_sb = ttk.Spinbox(time_frame, from_=0, to=59, width=4,
+                             textvariable=min_var, font=("Segoe UI", 11),
+                             format="%02.0f")
+        min_sb.pack(side="left")
+        ampm_cb = ttk.Combobox(time_frame, textvariable=ampm_var, width=5,
+                               values=["AM", "PM"], state="readonly",
+                               font=("Segoe UI", 11))
+        ampm_cb.pack(side="left", padx=(8, 0))
+
+        # Current schedule display
+        sched_label = ttk.Label(frame, text="", font=("Segoe UI", 9))
+        sched_label.pack(pady=(8, 8))
+
+        def update_sched_label():
+            if keepalive.stop_time:
+                t = keepalive.stop_time
+                ap = "AM" if t.hour < 12 else "PM"
+                h12 = t.hour % 12 or 12
+                sched_label.config(text=f"Scheduled stop: {h12}:{t.minute:02d} {ap}",
+                                   foreground="green")
+            else:
+                sched_label.config(text="No auto-stop scheduled", foreground="gray")
+
+        update_sched_label()
+
+        # --- Buttons ---
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=(8, 0))
+
+        def on_set():
+            try:
+                h = int(hour_var.get())
+                m = int(min_var.get())
+                ap = ampm_var.get().upper()
+                if not (1 <= h <= 12) or not (0 <= m <= 59):
+                    raise ValueError
+                # Convert to 24-hour
+                if ap == "PM" and h != 12:
+                    h += 12
+                elif ap == "AM" and h == 12:
+                    h = 0
+                stop_t = datetime.time(h, m)
+                keepalive.schedule_stop(stop_t)
+                update_sched_label()
+            except ValueError:
+                sched_label.config(text="Invalid time! Use HH:MM", foreground="red")
+
+        def on_clear():
+            keepalive.cancel_stop_schedule()
+            update_sched_label()
+
+        def on_close():
+            root.destroy()
+
+        ttk.Button(btn_frame, text="✅ Set Stop Time", command=on_set).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="❌ Clear", command=on_clear).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Close", command=on_close).pack(side="left", padx=4)
+
+        # Centre on screen
+        root.update_idletasks()
+        w, h = root.winfo_width(), root.winfo_height()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        root.mainloop()
+
+        if on_done:
+            on_done()
+
+    # Run tkinter in a separate thread
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
 
 
 # --- Main app --------------------------------------------------------------
@@ -229,6 +385,9 @@ def main():
     def on_cycle_interval(icon, item):
         keepalive.cycle_interval()
         icon.update_menu()
+
+    def on_schedule(icon, item):
+        show_schedule_dialog(keepalive, on_done=lambda: icon.update_menu())
 
     def on_quit(icon, item):
         log.info("Quit requested by user")
@@ -247,6 +406,14 @@ def main():
             MenuItem(
                 lambda item: f"⏱  Interval: {keepalive.interval // 60} min  (click to change)",
                 on_cycle_interval,
+            ),
+            MenuItem(
+                lambda item: (
+                    f"🕑  Auto-stop: {keepalive.stop_time.strftime('%I:%M %p').lstrip('0')}"
+                    if keepalive.stop_time
+                    else "🕑  Schedule Auto-Stop…"
+                ),
+                on_schedule,
             ),
             Menu.SEPARATOR,
             MenuItem(
