@@ -12,7 +12,7 @@ It combines two non-disruptive signals:
 
 Runs quietly in the system tray.  Right-click the icon to:
   - Toggle the keep-alive on / off
-  - Change the activity interval (default 4 minutes)
+  - Change the activity interval (2 / 3 / 4 / 5 / 10 minutes)
   - Quit the app
 
 Tested on Windows 10/11, macOS, and Linux (with AppIndicator / tray support).
@@ -25,16 +25,17 @@ marking you as "Away".  Use it responsibly and in accordance with
 your organisation's IT and acceptable-use policies.
 """
 
+import os
 import threading
 import time
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 
 # --- Third-party libraries -------------------------------------------------
 # pystray      – system-tray icon and menu
 # Pillow       – required by pystray for the icon image
 # pynput       – cross-platform keyboard & mouse control
-# tkinter      – for the simple interval-input dialog (stdlib, no pip install)
 
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
@@ -49,12 +50,27 @@ MAX_INTERVAL = 1800              # 30 min ceiling
 
 APP_NAME = "Teams Keep-Alive"
 
+# --- Logging ---------------------------------------------------------------
+# Logs go to both stdout and a rotating file so you can share them if
+# something goes wrong.
+
+LOG_DIR = os.path.join(os.path.expanduser("~"), ".teams_keepalive")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "keepalive.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        RotatingFileHandler(LOG_FILE, maxBytes=512_000, backupCount=3),
+    ],
 )
 log = logging.getLogger("keepalive")
+
+log.info("=" * 60)
+log.info("Teams Keep-Alive starting up")
+log.info("Log file: %s", LOG_FILE)
 
 
 # --- Activity simulator ----------------------------------------------------
@@ -100,6 +116,10 @@ class KeepAlive:
         seconds = max(MIN_INTERVAL, min(MAX_INTERVAL, seconds))
         self.interval = seconds
         log.info("Interval set to %ss", seconds)
+        # restart the loop so the new interval takes effect immediately
+        if self.running:
+            self.stop()
+            self.start()
 
     # -- the actual activity simulation ------------------------------------
 
@@ -107,8 +127,10 @@ class KeepAlive:
         """Press F15 (harmless) and jiggle the mouse by 1 px."""
         try:
             # F15 is a non-action key on essentially all software
-            self.keyboard.press(__import__('pynput').keyboard.Key.f15)
-            self.keyboard.release(__import__('pynput').keyboard.Key.f15)
+            from pynput.keyboard import Key as KbdKey
+            self.keyboard.press(KbdKey.f15)
+            self.keyboard.release(KbdKey.f15)
+            log.debug("F15 key pressed")
         except Exception as e:
             log.warning("Keyboard simulate failed: %s", e)
 
@@ -117,6 +139,7 @@ class KeepAlive:
             self.mouse.position = (pos[0] + 1, pos[1] + 1)
             time.sleep(0.05)
             self.mouse.position = (pos[0], pos[1])
+            log.debug("Mouse jiggled from %s", pos)
         except Exception as e:
             log.warning("Mouse simulate failed: %s", e)
 
@@ -146,31 +169,17 @@ def create_icon_image(active: bool) -> Image.Image:
     return img
 
 
-# --- Interval dialog (tiny tkinter popup) ----------------------------------
-
-def ask_interval(default: int) -> int:
-    """Pop up a minimal dialog asking for the interval in minutes."""
-    try:
-        import tkinter as tk
-        from tkinter import simpledialog
-    except Exception:
-        log.warning("tkinter not available; keeping current interval")
-        return default
-
-    root = tk.Tk()
-    root.withdraw()
-    val = simpledialog.askinteger(
-        APP_NAME,
-        "Activity interval (minutes):",
-        initialvalue=max(1, default // 60),
-        minvalue=1,
-        maxvalue=30,
-    )
-    root.destroy()
-    return val * 60 if val else default
-
-
 # --- Main app --------------------------------------------------------------
+
+# Preset interval choices (seconds).  Avoids any blocking dialog.
+INTERVAL_CHOICES = [
+    ("2 minutes", 120),
+    ("3 minutes", 180),
+    ("4 minutes (default)", 240),
+    ("5 minutes", 300),
+    ("10 minutes", 600),
+]
+
 
 def main():
     keepalive = KeepAlive()
@@ -183,20 +192,18 @@ def main():
         icon.icon = create_icon_image(keepalive.running)
         icon.update_menu()
 
-    def on_set_interval(icon, item):
-        new = ask_interval(keepalive.interval)
-        keepalive.set_interval(new)
-        was_running = keepalive.running
-        if was_running:
-            keepalive.stop()
-            keepalive.start()
-        icon.update_menu()
+    def make_interval_handler(seconds):
+        def handler(icon, item):
+            keepalive.set_interval(seconds)
+            icon.update_menu()
+        return handler
 
     def on_quit(icon, item):
+        log.info("Quit requested by user")
         keepalive.stop()
         icon.stop()
 
-    # build the tray icon — note `icon` is referenced inside callbacks
+    # build the tray icon
     icon = Icon(
         APP_NAME,
         icon=create_icon_image(False),
@@ -206,9 +213,11 @@ def main():
                 lambda item: ("⏸  Pause" if keepalive.running else "▶  Start"),
                 on_toggle,
             ),
+            Menu.SEPARATOR,
             MenuItem(
-                "⏱  Set Interval…",
-                on_set_interval,
+                "⏱  Interval",
+                Menu(MenuItem(label, make_interval_handler(secs))
+                     for label, secs in INTERVAL_CHOICES),
             ),
             Menu.SEPARATOR,
             MenuItem(
