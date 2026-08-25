@@ -202,8 +202,10 @@ def main():
         keepalive.stop()
         icon.stop()
 
-    # Build the interval submenu as a LIST (not a generator — pystray
-    # needs to iterate the items multiple times to check .visible).
+    # Build interval submenu items as a list of MenuItem objects.
+    # IMPORTANT: pass them with * unpacking — Menu(*items) takes variadic
+    # args, not a single list.  Passing a list as one arg makes pystray
+    # treat the list itself as a menu item, causing AttributeError.
     interval_items = [
         MenuItem(label, make_interval_handler(secs))
         for label, secs in INTERVAL_CHOICES
@@ -222,7 +224,7 @@ def main():
             Menu.SEPARATOR,
             MenuItem(
                 "⏱  Interval",
-                Menu(interval_items),
+                Menu(*interval_items),
             ),
             Menu.SEPARATOR,
             MenuItem(
