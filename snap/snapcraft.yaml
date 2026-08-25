@@ -1,0 +1,57 @@
+name: teams-keepalive
+version: '2.0.0'
+summary: Keep your Microsoft Teams status Available
+description: |
+  A cross-platform Python system-tray app that keeps your Microsoft Teams
+  status "Available" by simulating minimal, non-disruptive user activity
+  at a regular interval. It presses the F15 key and jiggles the mouse 2px
+  every few minutes so the OS sees fresh input and Teams never marks you
+  as "Away".
+
+  Features:
+  - System tray app (runs quietly in background)
+  - Global hotkey Ctrl+Shift+K to pause/resume
+  - Multiple stop times with scheduler
+  - Work hours mode (only run during set hours)
+  - Randomized jitter for human-like patterns
+  - Config persistence
+  - Wayland native support (ydotool)
+
+confinement: strict
+base: core22
+grade: stable
+
+apps:
+  teams-keepalive:
+    command: python3 $SNAP/teams_keepalive.py
+    environment:
+      HOME: $SNAP_USER_DATA
+      PYTHONPATH: $SNAP
+    plugs:
+      - home
+      - desktop
+      - x11
+      - wayland
+      - unity7
+
+parts:
+  teams-keepalive:
+    plugin: python
+    source: .
+    python-requirements:
+      - requirements.txt
+    stage:
+      - teams_keepalive.py
+      - generate_icon.py
+      - requirements.txt
+      - usr/lib/python3/dist-packages
+      - usr/bin/python3
+
+  icon:
+    plugin: dump
+    source: .
+    stage:
+      - teams_keepalive.ico
+    override-build: |
+      craftctl default
+      python3 generate_icon.py
