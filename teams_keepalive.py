@@ -39,7 +39,7 @@ from logging.handlers import RotatingFileHandler
 
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
-from pynput.keyboard import Controller as KeyboardController
+from pynput.keyboard import Controller as KeyboardController, Key as KbdKey
 from pynput.mouse import Controller as MouseController
 
 # --- Configuration ---------------------------------------------------------
@@ -127,7 +127,6 @@ class KeepAlive:
         """Press F15 (harmless) and jiggle the mouse by 1 px."""
         try:
             # F15 is a non-action key on essentially all software
-            from pynput.keyboard import Key as KbdKey
             self.keyboard.press(KbdKey.f15)
             self.keyboard.release(KbdKey.f15)
             log.debug("F15 key pressed")
@@ -203,6 +202,13 @@ def main():
         keepalive.stop()
         icon.stop()
 
+    # Build the interval submenu as a LIST (not a generator — pystray
+    # needs to iterate the items multiple times to check .visible).
+    interval_items = [
+        MenuItem(label, make_interval_handler(secs))
+        for label, secs in INTERVAL_CHOICES
+    ]
+
     # build the tray icon
     icon = Icon(
         APP_NAME,
@@ -216,8 +222,7 @@ def main():
             Menu.SEPARATOR,
             MenuItem(
                 "⏱  Interval",
-                Menu(MenuItem(label, make_interval_handler(secs))
-                     for label, secs in INTERVAL_CHOICES),
+                Menu(interval_items),
             ),
             Menu.SEPARATOR,
             MenuItem(
