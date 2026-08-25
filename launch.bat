@@ -1,22 +1,19 @@
 @echo off
-REM ============================================================
-REM  Teams Keep-Alive — Desktop Launcher
-REM  Double-click this file to start the app.
-REM  Put this file and teams_keepalive.py in the same folder.
-REM ============================================================
+REM Teams Keep-Alive - Windows Launcher
+REM Double-click this file to start the app
 
 cd /d "%~dp0"
 
-REM Try "pythonw" first (no console window), fall back to "py" (Windows Python Launcher)
+REM Try pythonw first (no console window), fall back to python
 where pythonw >nul 2>nul
-if %ERRORLEVEL% == 0 (
-    pythonw teams_keepalive.py
+if %errorlevel%==0 (
+    start "" pythonw "%~dp0teams_keepalive.py"
 ) else (
-    where pyw >nul 2>nul
-    if %ERRORLEVEL% == 0 (
-        pyw teams_keepalive.py
+    where python >nul 2>nul
+    if %errorlevel%==0 (
+        start "" python "%~dp0teams_keepalive.py"
     ) else (
-        echo Python not found! Please install Python from https://www.python.org/downloads/
+        echo ERROR: Python not found. Please install Python 3.8+ from https://python.org
         pause
     )
 )
