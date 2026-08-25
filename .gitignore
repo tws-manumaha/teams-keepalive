@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Generated files
+teams_keepalive.ico
+*.spec.bak
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs (local testing)
+*.log
+
+# PyInstaller
+*.manifest
+
+# Snap/Flatpak build artifacts
+snap/.snapcraft/
+.flatpak-builder/
