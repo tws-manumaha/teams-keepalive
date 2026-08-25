@@ -8,14 +8,16 @@ status "Available" by simulating minimal user activity at a regular interval.
 It combines two non-disruptive signals:
   1. Presses the F15 key (a virtually unused key that triggers no action on
      any normal application).
-  2. Jiggles the mouse by 1 pixel and back (imperceptible during real work).
+  2. Jiggles the mouse by 2 pixels and back (imperceptible during real work).
 
 Runs quietly in the system tray.  Right-click the icon to:
   - Toggle the keep-alive on / off
   - Cycle the activity interval (2 / 3 / 4 / 5 / 10 minutes)
   - Quit the app
 
-Tested on Windows 10/11, macOS, and Linux (with AppIndicator / tray support).
+On Windows, input simulation uses ctypes (Win32 API) directly — no
+third-party dependency, compatible with any Python version including 3.14+.
+On macOS/Linux, pynput is used as a fallback.
 
 ---------------------------------------------------------------
 DISCLAIMER
@@ -26,6 +28,7 @@ your organisation's IT and acceptable-use policies.
 """
 
 import os
+import platform
 import threading
 import time
 import sys
@@ -33,14 +36,66 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # --- Third-party libraries -------------------------------------------------
-# pystray      – system-tray icon and menu
-# Pillow       – required by pystray for the icon image
-# pynput       – cross-platform keyboard & mouse control
+# pystray  – system-tray icon and menu
+# Pillow   – required by pystray for the icon image
+# pynput   – only needed on macOS/Linux (Windows uses ctypes)
 
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
-from pynput.keyboard import Controller as KeyboardController, Key as KbdKey
-from pynput.mouse import Controller as MouseController
+
+IS_WINDOWS = platform.system() == "Windows"
+
+# --- Windows input simulation via ctypes -----------------------------------
+
+if IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes
+
+    # Virtual-key code for F15
+    VK_F15 = 0x7E
+
+    # keybd_event flags
+    KEYEVENTF_KEYUP = 0x0002
+
+    # mouse_event flags
+    MOUSEEVENTF_MOVE = 0x0001
+
+    def press_f15():
+        """Press and release F15 using the Win32 API."""
+        ctypes.windll.user32.keybd_event(VK_F15, 0, 0, 0)            # key down
+        ctypes.windll.user32.keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0)  # key up
+
+    def jiggle_mouse():
+        """Move the mouse 2px and back using the Win32 API."""
+        # Read current cursor position
+        point = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+        orig_x, orig_y = point.x, point.y
+
+        # Move 2px right-down
+        ctypes.windll.user32.SetCursorPos(orig_x + 2, orig_y + 2)
+        time.sleep(0.05)
+        # Move back
+        ctypes.windll.user32.SetCursorPos(orig_x, orig_y)
+
+else:
+    # macOS / Linux fallback using pynput
+    from pynput.keyboard import Controller as KeyboardController, Key as KbdKey
+    from pynput.mouse import Controller as MouseController
+
+    _kb = KeyboardController()
+    _mouse = MouseController()
+
+    def press_f15():
+        _kb.press(KbdKey.f15)
+        _kb.release(KbdKey.f15)
+
+    def jiggle_mouse():
+        pos = _mouse.position
+        _mouse.position = (pos[0] + 2, pos[1] + 2)
+        time.sleep(0.05)
+        _mouse.position = (pos[0], pos[1])
+
 
 # --- Configuration ---------------------------------------------------------
 
@@ -49,9 +104,6 @@ APP_NAME = "Teams Keep-Alive"
 # Interval choices in seconds (cycled by clicking the Interval menu item)
 INTERVALS = [120, 180, 240, 300, 600]  # 2, 3, 4, 5, 10 minutes
 DEFAULT_INTERVAL_IDX = 2  # 240 seconds = 4 minutes
-
-MIN_INTERVAL = 30
-MAX_INTERVAL = 1800
 
 # --- Logging ---------------------------------------------------------------
 
@@ -72,6 +124,8 @@ log = logging.getLogger("keepalive")
 log.info("=" * 60)
 log.info("Teams Keep-Alive starting up")
 log.info("Log file: %s", LOG_FILE)
+log.info("Platform: %s | Input method: %s",
+         platform.system(), "ctypes (Win32 API)" if IS_WINDOWS else "pynput")
 
 
 # --- Activity simulator ----------------------------------------------------
@@ -85,8 +139,7 @@ class KeepAlive:
         self.running = False
         self._thread = None
         self._stop_event = threading.Event()
-        self.keyboard = KeyboardController()
-        self.mouse = MouseController()
+        self._ping_count = 0
 
     def start(self):
         if self.running:
@@ -122,22 +175,23 @@ class KeepAlive:
             self.start()
 
     def _simulate_activity(self):
-        """Press F15 (harmless) and jiggle the mouse by 1 px."""
-        try:
-            self.keyboard.press(KbdKey.f15)
-            self.keyboard.release(KbdKey.f15)
-            log.debug("F15 key pressed")
-        except Exception as e:
-            log.warning("Keyboard simulate failed: %s", e)
+        """Press F15 (harmless) and jiggle the mouse by 2 px."""
+        self._ping_count += 1
 
         try:
-            pos = self.mouse.position
-            self.mouse.position = (pos[0] + 1, pos[1] + 1)
-            time.sleep(0.05)
-            self.mouse.position = (pos[0], pos[1])
-            log.debug("Mouse jiggled from %s", pos)
+            press_f15()
         except Exception as e:
-            log.warning("Mouse simulate failed: %s", e)
+            log.error("F15 keypress FAILED: %s", e)
+            return
+
+        try:
+            jiggle_mouse()
+        except Exception as e:
+            log.error("Mouse jiggle FAILED: %s", e)
+            return
+
+        log.info("Activity ping #%d — F15 pressed, mouse jiggled (interval: %ss)",
+                 self._ping_count, self.interval)
 
     def _loop(self):
         self._simulate_activity()
@@ -181,7 +235,6 @@ def main():
         keepalive.stop()
         icon.stop()
 
-    # All flat menu items — no submenus, no lists, no generators.
     icon = Icon(
         APP_NAME,
         icon=create_icon_image(False),
