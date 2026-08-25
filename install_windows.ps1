@@ -1,6 +1,6 @@
 # ============================================================
-#  Teams Keep-Alive — Windows Installer
-#  Right-click → "Run with PowerShell"
+#  Teams Keep-Alive - Windows Installer
+#  Right-click -> "Run with PowerShell"
 #  or:  powershell -ExecutionPolicy Bypass -File install_windows.ps1
 # ============================================================
 
@@ -9,14 +9,14 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-function Write-Step($msg) { Write-Host "`n▶ $msg" -ForegroundColor Cyan }
-function Write-Ok($msg)   { Write-Host "  ✅ $msg" -ForegroundColor Green }
-function Write-Warn($msg)  { Write-Host "  ⚠ $msg" -ForegroundColor Yellow }
-function Write-Err($msg)   { Write-Host "  ❌ $msg" -ForegroundColor Red }
+function Write-Step($msg) { Write-Host "`n> $msg" -ForegroundColor Cyan }
+function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn($msg)  { Write-Host "  [!] $msg" -ForegroundColor Yellow }
+function Write-Err($msg)   { Write-Host "  [FAIL] $msg" -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Teams Keep-Alive — Windows Installer"    -ForegroundColor Cyan
+Write-Host "  Teams Keep-Alive - Windows Installer"    -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # --- 1. Check Python -------------------------------------------------------
@@ -69,12 +69,13 @@ if (Test-Path $GenScript) {
     & $PyForGen $GenScript 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     if (Test-Path $IconFile) {
         $IconSize = (Get-Item $IconFile).Length
-        Write-Ok "Icon created ($IconSize bytes)"
+        $sizeStr = "$IconSize"
+        Write-Ok "Icon created ($sizeStr bytes)"
     } else {
-        Write-Warn "Icon generation failed — shortcut will use default icon"
+        Write-Warn "Icon generation failed - shortcut will use default icon"
     }
 } else {
-    Write-Warn "generate_icon.py not found — skipping icon"
+    Write-Warn "generate_icon.py not found - skipping icon"
 }
 
 # --- 4. Create desktop shortcut ---------------------------------------------
@@ -92,7 +93,7 @@ $Shortcut.Arguments = "`"$TargetScript`""
 $Shortcut.WorkingDirectory = $ScriptDir
 if (Test-Path $IconFile) { $Shortcut.IconLocation = $IconFile }
 $Shortcut.Description = "Keep your Microsoft Teams status Available"
-$Shortcut.WindowStyle = 7  # Minimised — no console window
+$Shortcut.WindowStyle = 7  # Minimised - no console window
 $Shortcut.Save()
 
 Write-Ok "Shortcut created: $ShortcutPath"
