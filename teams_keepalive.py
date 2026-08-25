@@ -12,7 +12,7 @@ It combines two non-disruptive signals:
 
 Runs quietly in the system tray.  Right-click the icon to:
   - Toggle the keep-alive on / off
-  - Change the activity interval (2 / 3 / 4 / 5 / 10 minutes)
+  - Cycle the activity interval (2 / 3 / 4 / 5 / 10 minutes)
   - Quit the app
 
 Tested on Windows 10/11, macOS, and Linux (with AppIndicator / tray support).
@@ -44,15 +44,16 @@ from pynput.mouse import Controller as MouseController
 
 # --- Configuration ---------------------------------------------------------
 
-DEFAULT_INTERVAL = 240          # seconds between activity (4 min)
-MIN_INTERVAL = 30                # safety floor
-MAX_INTERVAL = 1800              # 30 min ceiling
-
 APP_NAME = "Teams Keep-Alive"
 
+# Interval choices in seconds (cycled by clicking the Interval menu item)
+INTERVALS = [120, 180, 240, 300, 600]  # 2, 3, 4, 5, 10 minutes
+DEFAULT_INTERVAL_IDX = 2  # 240 seconds = 4 minutes
+
+MIN_INTERVAL = 30
+MAX_INTERVAL = 1800
+
 # --- Logging ---------------------------------------------------------------
-# Logs go to both stdout and a rotating file so you can share them if
-# something goes wrong.
 
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".teams_keepalive")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -79,14 +80,13 @@ class KeepAlive:
     """Runs in a background thread and periodically jiggles input."""
 
     def __init__(self):
-        self.interval = DEFAULT_INTERVAL
+        self.interval = INTERVALS[DEFAULT_INTERVAL_IDX]
+        self.interval_idx = DEFAULT_INTERVAL_IDX
         self.running = False
         self._thread = None
         self._stop_event = threading.Event()
         self.keyboard = KeyboardController()
         self.mouse = MouseController()
-
-    # -- thread control ----------------------------------------------------
 
     def start(self):
         if self.running:
@@ -112,21 +112,18 @@ class KeepAlive:
         else:
             self.start()
 
-    def set_interval(self, seconds: int):
-        seconds = max(MIN_INTERVAL, min(MAX_INTERVAL, seconds))
-        self.interval = seconds
-        log.info("Interval set to %ss", seconds)
-        # restart the loop so the new interval takes effect immediately
+    def cycle_interval(self):
+        """Advance to the next interval in the list and restart if running."""
+        self.interval_idx = (self.interval_idx + 1) % len(INTERVALS)
+        self.interval = INTERVALS[self.interval_idx]
+        log.info("Interval cycled to %ss (%s min)", self.interval, self.interval // 60)
         if self.running:
             self.stop()
             self.start()
 
-    # -- the actual activity simulation ------------------------------------
-
     def _simulate_activity(self):
         """Press F15 (harmless) and jiggle the mouse by 1 px."""
         try:
-            # F15 is a non-action key on essentially all software
             self.keyboard.press(KbdKey.f15)
             self.keyboard.release(KbdKey.f15)
             log.debug("F15 key pressed")
@@ -143,10 +140,8 @@ class KeepAlive:
             log.warning("Mouse simulate failed: %s", e)
 
     def _loop(self):
-        # Send one ping immediately so status updates quickly
         self._simulate_activity()
         while not self._stop_event.is_set():
-            # Wait for interval, but wake early if stop is signalled
             if self._stop_event.wait(self.interval):
                 break
             self._simulate_activity()
@@ -159,9 +154,8 @@ def create_icon_image(active: bool) -> Image.Image:
     """Draw a simple tray icon: green circle when active, grey when idle."""
     img = Image.new("RGB", (64, 64), (30, 30, 30))
     draw = ImageDraw.Draw(img)
-    colour = (76, 175, 80) if active else (120, 120, 120)  # green / grey
+    colour = (76, 175, 80) if active else (120, 120, 120)
     draw.ellipse((12, 12, 52, 52), fill=colour)
-    # simple "K" mark
     draw.line((28, 20, 28, 44), fill=(255, 255, 255), width=3)
     draw.line((28, 32, 40, 20), fill=(255, 255, 255), width=3)
     draw.line((28, 32, 40, 44), fill=(255, 255, 255), width=3)
@@ -170,48 +164,24 @@ def create_icon_image(active: bool) -> Image.Image:
 
 # --- Main app --------------------------------------------------------------
 
-# Preset interval choices (seconds).  Avoids any blocking dialog.
-INTERVAL_CHOICES = [
-    ("2 minutes", 120),
-    ("3 minutes", 180),
-    ("4 minutes (default)", 240),
-    ("5 minutes", 300),
-    ("10 minutes", 600),
-]
-
-
 def main():
     keepalive = KeepAlive()
-
-    def status_text():
-        return "Running" if keepalive.running else "Paused"
 
     def on_toggle(icon, item):
         keepalive.toggle()
         icon.icon = create_icon_image(keepalive.running)
         icon.update_menu()
 
-    def make_interval_handler(seconds):
-        def handler(icon, item):
-            keepalive.set_interval(seconds)
-            icon.update_menu()
-        return handler
+    def on_cycle_interval(icon, item):
+        keepalive.cycle_interval()
+        icon.update_menu()
 
     def on_quit(icon, item):
         log.info("Quit requested by user")
         keepalive.stop()
         icon.stop()
 
-    # Build interval submenu items as a list of MenuItem objects.
-    # IMPORTANT: pass them with * unpacking — Menu(*items) takes variadic
-    # args, not a single list.  Passing a list as one arg makes pystray
-    # treat the list itself as a menu item, causing AttributeError.
-    interval_items = [
-        MenuItem(label, make_interval_handler(secs))
-        for label, secs in INTERVAL_CHOICES
-    ]
-
-    # build the tray icon
+    # All flat menu items — no submenus, no lists, no generators.
     icon = Icon(
         APP_NAME,
         icon=create_icon_image(False),
@@ -221,19 +191,13 @@ def main():
                 lambda item: ("⏸  Pause" if keepalive.running else "▶  Start"),
                 on_toggle,
             ),
-            Menu.SEPARATOR,
             MenuItem(
-                "⏱  Interval",
-                Menu(*interval_items),
+                lambda item: f"⏱  Interval: {keepalive.interval // 60} min  (click to change)",
+                on_cycle_interval,
             ),
             Menu.SEPARATOR,
             MenuItem(
-                lambda item: f"Status: {status_text()}",
-                None,
-                enabled=False,
-            ),
-            MenuItem(
-                lambda item: f"Interval: {keepalive.interval // 60} min",
+                lambda item: f"Status: {'Running' if keepalive.running else 'Paused'}",
                 None,
                 enabled=False,
             ),
@@ -242,7 +206,6 @@ def main():
         ),
     )
 
-    # auto-start on launch
     keepalive.start()
     icon.icon = create_icon_image(True)
 
