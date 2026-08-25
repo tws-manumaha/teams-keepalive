@@ -1,0 +1,45 @@
+# Flatpak manifest for Teams Keep-Alive
+# Build: flatpak-builder build-dir com.teams-keepalive.app.json
+{
+  "app-id": "com.teams-keepalive.app",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "23.08",
+  "sdk": "org.freedesktop.Sdk",
+  "command": "teams-keepalive.sh",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=x11",
+    "--socket=wayland",
+    "--filesystem=home",
+    "--talk-name=org.kde.StatusNotifierItem",
+    "--talk-name=org.freedesktop.Notifications"
+  ],
+  "modules": [
+    {
+      "name": "python3-pystray",
+      "buildsystem": "simple",
+      "build-commands": [
+        "pip3 install --no-index --find-links=. pystray Pillow pynput"
+      ],
+      "sources": []
+    },
+    {
+      "name": "teams-keepalive",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 teams_keepalive.py /app/bin/teams_keepalive.py",
+        "install -Dm755 generate_icon.py /app/bin/generate_icon.py",
+        "install -Dm755 teams-keepalive.sh /app/bin/teams-keepalive.sh",
+        "python3 /app/bin/generate_icon.py",
+        "install -Dm644 teams_keepalive.ico /app/share/icons/hicolor/256x256/apps/teams-keepalive.png",
+        "install -Dm644 com.teams-keepalive.app.desktop /app/share/applications/com.teams-keepalive.app.desktop"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": "."
+        }
+      ]
+    }
+  ]
+}
