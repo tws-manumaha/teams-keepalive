@@ -13,7 +13,7 @@ Platforms:
 Tray:
   - pystray with FLAT MenuItem items only (no submenus).
   - pystray runs in a daemon thread; tkinter runs in the main thread.
-  - Tray callbacks schedule UI work via root.after(0, callback).
+  - Tray callbacks schedule UI work via a thread-safe queue.Queue, polled by the main thread.
 
 Features (v2.0):
   - Config persistence (~/.teams_keepalive/config.json)
@@ -36,6 +36,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import queue
 import random
 import subprocess
 import sys
@@ -520,7 +521,7 @@ class SettingsDialog:
 
     Uses a Toplevel window (not a separate Tk() instance) so it integrates
     with the hidden root Tk() that drives the main thread mainloop.
-    Must be called from the main thread via root.after().
+    Must be called from the main thread via _poll_ui_queue.
     """
 
     def __init__(self, root: Any, config: Config, on_change: Optional[Callable[[], None]]) -> None:
@@ -687,7 +688,11 @@ class KeepaliveApp:
       - Main thread: runs tk.Tk().mainloop() (the hidden root).
       - Daemon thread: runs pystray icon.run() (tray event loop).
       - Daemon thread: runs _scheduler_loop() (activity jiggles).
-      - Tray callbacks: schedule UI work via root.after(0, callback).
+      - Tray callbacks: put tasks into self._ui_queue (a thread-safe
+        queue.Queue). The main thread polls this queue every 100ms via
+        _poll_ui_queue(), which is scheduled by root.after() on itself
+        (same thread, so it is safe). This is the standard pattern for
+        cross-thread tkinter communication.
     """
 
     def __init__(self) -> None:
@@ -706,6 +711,7 @@ class KeepaliveApp:
         self._stop_lock = threading.Lock()
         self._current_stop_target: Optional[datetime] = None
         self._root: Any = None  # tk.Tk instance (hidden)
+        self._ui_queue: queue.Queue = queue.Queue()  # thread-safe UI task queue
         self._recompute_stop_target()
 
     def start(self) -> None:
@@ -716,6 +722,11 @@ class KeepaliveApp:
         import tkinter as tk
         self._root = tk.Tk()
         self._root.withdraw()  # hide the root window
+
+        # Start polling the UI queue from the main thread.
+        # Tray callbacks put tasks into self._ui_queue (thread-safe);
+        # this polling loop picks them up and executes them on the main thread.
+        self._poll_ui_queue()
 
         # Start the hotkey listener (if enabled).
         if self.config.get("hotkey_enabled", True):
@@ -770,7 +781,7 @@ class KeepaliveApp:
                 log.info("Tray loop exited")
             except Exception as exc:
                 log.error("Tray icon failed: %s", exc, exc_info=True)
-                self._root.after(0, lambda: self._show_error_dialog(
+                self._ui_queue.put(lambda: self._show_error_dialog(
                     "Teams Keep-Alive - Tray Error",
                     ("Failed to create the system tray icon.\n\n"
                      "Error: {}\n\nCheck the log file at:\n  {}").format(exc, LOG_PATH_IN_USE)))
@@ -928,7 +939,31 @@ class KeepaliveApp:
             except Exception:
                 pass
 
-    # -- tray callbacks (run in pystray thread; schedule UI via root.after) --
+    # -- UI queue (thread-safe bridge from tray thread to main thread) -----
+    def _poll_ui_queue(self) -> None:
+        """Drain the UI queue and execute callbacks on the main thread.
+
+        Called from the main thread via root.after(). Tray callbacks put
+        tasks into self._ui_queue (a thread-safe queue.Queue); this method
+        picks them up and runs them on the main thread where tkinter is safe.
+        """
+        try:
+            while True:
+                task = self._ui_queue.get_nowait()
+                try:
+                    task()
+                except Exception as exc:
+                    log.warning("UI queue task error: %s", exc)
+        except queue.Empty:
+            pass
+        # Re-schedule ourselves on the main thread (same thread = safe).
+        if self.running.is_set() and self._root is not None:
+            try:
+                self._root.after(100, self._poll_ui_queue)
+            except Exception:
+                pass  # root may have been destroyed during shutdown
+
+    # -- tray callbacks (run in pystray thread; put tasks into UI queue) ---
     def _on_cycle_interval(self, icon: Any, item: Any) -> None:
         current = int(self.config.get("interval", 60))
         if current in INTERVAL_PRESETS:
@@ -945,11 +980,11 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_open_settings(self, icon: Any, item: Any) -> None:
-        # Schedule the settings dialog on the main thread.
-        self._root.after(0, self._show_settings)
+        # Put the settings task into the queue; the main thread will pick it up.
+        self._ui_queue.put(self._show_settings)
 
     def _show_settings(self) -> None:
-        """Called on the main thread via root.after()."""
+        """Called on the main thread via _poll_ui_queue."""
         SettingsDialog(self._root, self.config, on_change=self._on_settings_changed).show()
 
     def _on_settings_changed(self) -> None:
@@ -966,12 +1001,11 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_quit(self, icon: Any, item: Any) -> None:
-        # Schedule destruction of the tk root on the main thread.
-        # This causes mainloop() to exit, which lets the app clean up and exit.
-        self._root.after(0, self._do_quit)
+        # Put the quit task into the queue; the main thread will pick it up.
+        self._ui_queue.put(self._do_quit)
 
     def _do_quit(self) -> None:
-        """Called on the main thread via root.after()."""
+        """Called on the main thread via _poll_ui_queue."""
         log.info("Quit requested; destroying root")
         self._root.destroy()
 
