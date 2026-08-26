@@ -391,29 +391,34 @@ def next_stop_datetime(stop_times: List[str], now: Optional[datetime] = None
                        ) -> Optional[datetime]:
     """Return the nearest upcoming stop datetime from a list of "HH:MM".
 
-    None if the list is empty. Past-today times are skipped; if none remain
-    today, the earliest time tomorrow is returned.
+    None if the list is empty. If any times are in the future today, the
+    nearest one is returned. If all times are in the past today, the most
+    recent past time is returned so it triggers immediately (instead of
+    silently rolling to tomorrow and never stopping).
     """
     if not stop_times:
         return None
     if now is None:
         now = datetime.now()
-    today_times: List[datetime] = []
-    all_times: List[dtime] = []
+    # Collect all valid times. If any are in the past today,
+    # return the nearest one so it triggers immediately.
+    all_today: List[datetime] = []
+    future_today: List[datetime] = []
     for raw in stop_times:
         t = parse_hhmm(raw)
         if t is None:
             continue
-        all_times.append(t)
         candidate = datetime.combine(now.date(), t)
+        all_today.append(candidate)
         if candidate > now:
-            today_times.append(candidate)
-    if today_times:
-        return min(today_times)
-    # All today's times passed; pick earliest tomorrow.
-    if all_times:
-        earliest = min(all_times)
-        return datetime.combine(now.date() + timedelta(days=1), earliest)
+            future_today.append(candidate)
+    if future_today:
+        return min(future_today)
+    # All today's times are in the past. Return the nearest past
+    # time so it triggers immediately on the next check, rather
+    # than rolling to tomorrow and silently never stopping.
+    if all_today:
+        return max(all_today)  # most recent past time -> triggers now
     return None
 
 
@@ -823,7 +828,8 @@ class KeepaliveApp:
                 self._set_paused(True, "stop_time")
                 continue
 
-            # If paused for any other reason, just sleep briefly.
+            # If paused (by stop_time, hotkey, or manual), just sleep briefly.
+            # The app stays in the tray but does NOT jiggle.
             if self.paused.is_set():
                 time.sleep(1.0)
                 continue
@@ -843,12 +849,16 @@ class KeepaliveApp:
             self._interruptible_sleep(max(sleep_for, 1.0))
 
     def _interruptible_sleep(self, seconds: float) -> None:
-        """Sleep for `seconds`, waking every 1s to check running/pause."""
+        """Sleep for `seconds`, waking every 1s to check running/pause/stop."""
         end = time.monotonic() + seconds
         while self.running.is_set() and time.monotonic() < end:
             if self.paused.is_set():
-                time.sleep(0.5)
-                continue
+                return  # paused - return immediately so main loop can handle it
+            # Also check if a stop-time has arrived during this sleep.
+            with self._stop_lock:
+                target = self._current_stop_target
+            if target is not None and datetime.now() >= target:
+                return  # stop time arrived - return so main loop triggers it
             time.sleep(min(1.0, end - time.monotonic() + 1e-3))
 
     def _sleep_until_work_boundary(self, start: str, end: str) -> None:
