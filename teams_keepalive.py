@@ -10,13 +10,14 @@ Platforms:
   - macOS   : pynput (keyboard + mouse control)
   - Linux   : pynput on X11; ydotool on Wayland (mouse jiggle); F15 keypress fallback
 
-Tray:
-  - pystray with FLAT MenuItem items only (no submenus).
-  - icon.run() on the main thread (blocking).
-  - Tray callbacks run in pystray's internal thread.
-  - Settings dialog creates its own Tk() + mainloop() directly from the callback.
-    This works on Windows because pystray uses a Win32 message pump that
-    handles nested event loops correctly.
+Tray architecture (v2.0.10):
+  - pystray runs in a BACKGROUND thread via icon.run_detached().
+  - tkinter mainloop() runs on the MAIN thread (always).
+  - Tray callbacks use root.after(0, callback) to schedule UI work
+    on the main thread (thread-safe).
+  - Settings dialog is a Toplevel window, NOT a new Tk() root.
+  - No nested mainloop() calls - the main loop is always running.
+  - Quit calls icon.stop() then root.quit().
 
 Features (v2.0):
   - Config persistence (~/.teams_keepalive/config.json)
@@ -519,30 +520,51 @@ def next_work_boundary_datetime(start: str, end: str, now: Optional[datetime] = 
 
 
 # ---------------------------------------------------------------------------
-# Settings GUI (tkinter, opens from tray callback)
+# Settings GUI (tkinter Toplevel, shown on the main thread)
 # ---------------------------------------------------------------------------
 class SettingsDialog:
-    """Tkinter settings dialog.
+    """Tkinter settings dialog using a Toplevel window.
 
-    Creates its own Tk() root + mainloop() directly from the tray callback.
-    On Windows, this works because pystray uses a Win32 message pump that
-    handles nested event loops. The tray icon stays responsive while the
-    dialog is open.
+    The main tkinter root + mainloop() is always running on the main thread.
+    This dialog creates a Toplevel (child window) and returns immediately.
+    The mainloop handles all event processing. No nested mainloops.
     """
 
-    def __init__(self, config: Config, on_change: Optional[Callable[[], None]]) -> None:
+    def __init__(self, config: Config, root: Any, on_change: Optional[Callable[[], None]]) -> None:
         self.config = config
+        self.root = root
         self.on_change = on_change
+        self.win: Optional[Any] = None
 
-    def run(self) -> None:
-        """Build and show the settings dialog with its own Tk root."""
-        log.info("SettingsDialog.run(): building dialog")
+    def show(self) -> None:
+        """Build and show the settings dialog as a Toplevel window."""
         import tkinter as tk
         from tkinter import ttk
 
-        root = tk.Tk()
-        root.title("Teams Keepalive - Settings")
-        root.resizable(False, False)
+        log.info("SettingsDialog.show(): building Toplevel dialog")
+
+        # If already open, bring to front
+        if self.win is not None:
+            try:
+                self.win.lift()
+                self.win.focus_force()
+                log.info("SettingsDialog already open; bringing to front")
+                return
+            except Exception:
+                self.win = None
+
+        win = tk.Toplevel(self.root)
+        win.title("Teams Keepalive - Settings")
+        win.resizable(False, False)
+        self.win = win
+
+        # Close handler
+        def on_close() -> None:
+            log.info("SettingsDialog: window closed by user")
+            self.win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
         interval_var = tk.IntVar(value=int(self.config.get("interval", 60)))
         jitter_var = tk.BooleanVar(value=bool(self.config.get("randomized_jitter", True)))
@@ -552,7 +574,7 @@ class SettingsDialog:
         wh_end_var = tk.StringVar(value=str(self.config.get("work_end", "17:00")))
         stop_times: List[str] = list(self.config.get("stop_times", []))
 
-        notebook = ttk.Notebook(root)
+        notebook = ttk.Notebook(win)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         # --- Tab 1: Activity ---
@@ -570,7 +592,8 @@ class SettingsDialog:
 
         col = 0
         for p in INTERVAL_PRESETS:
-            b = ttk.Button(preset_frame, text=INTERVAL_LABELS.get(p, f"{p}s"), command=lambda v=p: apply_preset(v))
+            b = ttk.Button(preset_frame, text=INTERVAL_LABELS.get(p, f"{p}s"),
+                           command=lambda v=p: apply_preset(v))
             b.grid(row=0, column=col, padx=2)
             col += 1
 
@@ -632,7 +655,7 @@ class SettingsDialog:
             row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 8))
 
         # --- Bottom buttons ---
-        btn_frame = ttk.Frame(root)
+        btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=8, pady=8)
 
         def apply_changes() -> None:
@@ -662,28 +685,32 @@ class SettingsDialog:
         def on_apply() -> None:
             apply_changes()
             err_label.config(text="Saved.")
-            root.after(1500, lambda: err_label.config(text=""))
+            win.after(1500, lambda: err_label.config(text=""))
 
         def on_ok() -> None:
             apply_changes()
-            root.destroy()
+            self.win = None
+            win.destroy()
 
         def on_cancel() -> None:
-            root.destroy()
+            self.win = None
+            win.destroy()
 
         ttk.Button(btn_frame, text="Apply", command=on_apply).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=4)
 
         # Center on screen
-        root.update_idletasks()
-        x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-        y = (root.winfo_screenheight() - root.winfo_height()) // 2
-        root.geometry(f"+{x}+{y}")
-        log.info("SettingsDialog.run(): dialog ready, entering mainloop")
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - win.winfo_width()) // 2
+        y = (win.winfo_screenheight() - win.winfo_height()) // 2
+        win.geometry(f"+{x}+{y}")
 
-        root.mainloop()
-        log.info("SettingsDialog.run(): mainloop exited")
+        # Make it transient and modal
+        win.transient(self.root)
+        win.grab_set()
+
+        log.info("SettingsDialog.show(): Toplevel dialog created and shown")
 
 
 # ---------------------------------------------------------------------------
@@ -692,12 +719,14 @@ class SettingsDialog:
 class KeepaliveApp:
     """Owns the config, input controller, scheduler thread, and tray icon.
 
-    Architecture (v2.0.9 - reverted to the working v2.0.5 pattern):
-      - Main thread: runs pystray icon.run() (blocking, Win32 message pump).
-      - Daemon thread: runs _scheduler_loop() (activity jiggles).
-      - Tray callbacks: run in pystray's internal thread.
-        Settings dialog creates its own Tk() + mainloop() directly.
-        Quit calls icon.stop() which causes icon.run() to return.
+    Architecture (v2.0.10):
+      - Main thread: runs tkinter root.mainloop() (always running).
+      - pystray runs in a BACKGROUND thread via icon.run_detached().
+      - Tray callbacks use root.after(0, callback) to schedule UI work
+        on the main thread (thread-safe).
+      - Settings dialog is a Toplevel window, NOT a new Tk() root.
+      - No nested mainloop() calls.
+      - Quit calls icon.stop() then root.quit().
     """
 
     def __init__(self) -> None:
@@ -715,10 +744,22 @@ class KeepaliveApp:
         self._tray_icon_grey: bytes = make_paused_icon()
         self._stop_lock = threading.Lock()
         self._current_stop_target: Optional[datetime] = None
+        self._root: Any = None  # tk.Tk() root, created on main thread
+        self._settings_dialog: Optional[SettingsDialog] = None
         self._recompute_stop_target()
 
     def start(self) -> None:
         log.info("Teams Keepalive v%s starting", APP_VERSION)
+
+        # Create the tkinter root on the main thread FIRST.
+        import tkinter as tk
+        self._root = tk.Tk()
+        self._root.withdraw()  # Hide the root window (we only show Toplevel dialogs)
+        log.info("tkinter root created (hidden)")
+
+        # Create the settings dialog handler.
+        self._settings_dialog = SettingsDialog(
+            self.config, self._root, on_change=self._on_settings_changed)
 
         # Start the hotkey listener (if enabled).
         if self.config.get("hotkey_enabled", True):
@@ -729,11 +770,15 @@ class KeepaliveApp:
             target=self._scheduler_loop, name="keepalive-scheduler", daemon=True)
         self._scheduler_thread.start()
 
-        # Run the tray icon on the main thread (blocking).
-        # This call blocks until icon.stop() is called.
+        # Start the tray icon in a background thread (non-blocking).
         self._run_tray()
 
-        # Cleanup after tray exits.
+        # Run tkinter mainloop on the main thread (blocking).
+        log.info("Entering tkinter mainloop (main thread)")
+        self._root.mainloop()
+        log.info("Tkinter mainloop exited")
+
+        # Cleanup after mainloop exits.
         self.running.clear()
         try:
             if self._hotkey_listener is not None:
@@ -762,9 +807,11 @@ class KeepaliveApp:
         icon = pystray.Icon(
             APP_NAME, icon=green_img, title=APP_NAME, menu=self._build_menu())
         self._tray = icon
-        log.info("Tray icon created; entering main loop")
-        icon.run()
-        log.info("Tray main loop exited")
+
+        # Run the tray icon in a background thread (non-blocking).
+        # This frees the main thread for tkinter's mainloop().
+        icon.run_detached()
+        log.info("Tray icon started (detached, background thread)")
 
     # -- pause/resume ------------------------------------------------------
     def _set_paused(self, paused: bool, reason: str) -> None:
@@ -791,7 +838,11 @@ class KeepaliveApp:
                 # pynput API changed in newer versions; try both import paths
                 ListenerClass = getattr(keyboard, 'GlobalHotKeyListener', None)
                 if ListenerClass is None:
-                    from pynput.keyboard import GlobalHotKeyListener as ListenerClass
+                    try:
+                        from pynput.keyboard import GlobalHotKeyListener as ListenerClass
+                    except ImportError:
+                        log.warning("Hotkey listener: GlobalHotKeyListener not available in this pynput version")
+                        return
                 self._hotkey_listener = ListenerClass({
                     HOTKEY_TOGGLE: lambda: self._on_hotkey()})
                 self._hotkey_listener.start()
@@ -880,11 +931,13 @@ class KeepaliveApp:
     # -- tray --------------------------------------------------------------
     def _build_menu(self) -> Any:
         import pystray
-        interval = int(self.config.get("interval", 60))
-        interval_label = INTERVAL_LABELS.get(interval, f"{interval}s")
         menu_items = [
-            pystray.MenuItem(f"Status: {'Paused' if self.paused.is_set() else 'Active'}", None, enabled=False),
-            pystray.MenuItem(f"Interval: {interval_label}", self._on_cycle_interval),
+            pystray.MenuItem(
+                lambda icon, item: f"Status: {'Paused' if self.paused.is_set() else 'Active'}",
+                None, enabled=False),
+            pystray.MenuItem(
+                lambda icon, item: f"Interval: {INTERVAL_LABELS.get(int(self.config.get('interval', 60)), str(self.config.get('interval', 60)) + 's')}",
+                self._on_cycle_interval),
             pystray.MenuItem("Pause / Resume", self._on_toggle_pause),
             pystray.MenuItem("Settings...", self._on_open_settings),
             pystray.MenuItem("Open log file", self._on_open_log),
@@ -921,9 +974,15 @@ class KeepaliveApp:
             except Exception:
                 pass
 
-    # -- tray callbacks ----------------------------------------------------
+    # -- tray callbacks (run in pystray's background thread) ---------------
+    # These use root.after(0, callback) to schedule work on the main thread.
+
     def _on_cycle_interval(self, icon: Any, item: Any) -> None:
         log.info("Tray callback: Cycle interval clicked")
+        if self._root is not None:
+            self._root.after(0, self._do_cycle_interval)
+
+    def _do_cycle_interval(self) -> None:
         current = int(self.config.get("interval", 60))
         if current in INTERVAL_PRESETS:
             idx = INTERVAL_PRESETS.index(current)
@@ -936,14 +995,27 @@ class KeepaliveApp:
 
     def _on_toggle_pause(self, icon: Any, item: Any) -> None:
         log.info("Tray callback: Pause/Resume clicked")
+        if self._root is not None:
+            self._root.after(0, self._do_toggle_pause)
+
+    def _do_toggle_pause(self) -> None:
         self.toggle_pause(reason="manual")
         self._rebuild_menu()
 
     def _on_open_settings(self, icon: Any, item: Any) -> None:
-        log.info("Tray callback: Settings... clicked, opening dialog")
+        log.info("Tray callback: Settings... clicked, scheduling on main thread")
+        if self._root is not None:
+            self._root.after(0, self._do_show_settings)
+
+    def _do_show_settings(self) -> None:
+        """Show the settings dialog. Runs on the main thread via root.after()."""
+        log.info("_do_show_settings: showing SettingsDialog (Toplevel)")
         try:
-            SettingsDialog(self.config, on_change=self._on_settings_changed).run()
-            log.info("Settings dialog closed")
+            if self._settings_dialog is not None:
+                self._settings_dialog.show()
+                log.info("_do_show_settings: SettingsDialog.show() returned (non-blocking)")
+            else:
+                log.error("_do_show_settings: settings_dialog is None")
         except Exception as exc:
             log.error("Settings dialog failed: %s", exc, exc_info=True)
 
@@ -962,11 +1034,26 @@ class KeepaliveApp:
 
     def _on_quit(self, icon: Any, item: Any) -> None:
         log.info("Tray callback: Quit clicked")
+        if self._root is not None:
+            self._root.after(0, self._do_quit)
+
+    def _do_quit(self) -> None:
+        log.info("Quit: stopping tray icon and tkinter")
         self.running.clear()
-        icon.stop()
+        try:
+            if self._tray is not None:
+                self._tray.stop()
+        except Exception:
+            pass
+        if self._root is not None:
+            self._root.quit()
 
     def _on_open_log(self, icon: Any, item: Any) -> None:
         log.info("Tray callback: Open log file clicked")
+        if self._root is not None:
+            self._root.after(0, self._do_open_log)
+
+    def _do_open_log(self) -> None:
         log_path = LOG_PATH_IN_USE if LOG_PATH_IN_USE else LOG_PATH
         if not os.path.exists(log_path):
             log.warning("Log file not found: %s", log_path)
