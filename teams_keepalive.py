@@ -12,6 +12,8 @@ Platforms:
 
 Tray:
   - pystray with FLAT MenuItem items only (no submenus).
+  - pystray runs in a daemon thread; tkinter runs in the main thread.
+  - Tray callbacks schedule UI work via root.after(0, callback).
 
 Features (v2.0):
   - Config persistence (~/.teams_keepalive/config.json)
@@ -22,6 +24,7 @@ Features (v2.0):
   - Wayland native support (ydotool, fallback F15 only)
   - Settings GUI (tkinter, tabbed sections)
   - Lock-screen aware: skips mouse jiggle when screen is locked (F15 only)
+  - Bulletproof logging with fallback paths
 
 Python 3.8+ compatible.
 """
@@ -89,7 +92,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 log: logging.Logger = logging.getLogger(APP_NAME)
-
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -511,39 +513,31 @@ def next_work_boundary_datetime(start: str, end: str, now: Optional[datetime] = 
 
 
 # ---------------------------------------------------------------------------
-# Settings GUI (tkinter)
+# Settings GUI (tkinter, runs in the main thread)
 # ---------------------------------------------------------------------------
 class SettingsDialog:
-    _lock = threading.Lock()
-    _open = False
+    """Tkinter settings dialog.
 
-    def __init__(self, config: Config, on_change: Optional[Callable[[], None]]) -> None:
+    Uses a Toplevel window (not a separate Tk() instance) so it integrates
+    with the hidden root Tk() that drives the main thread mainloop.
+    Must be called from the main thread via root.after().
+    """
+
+    def __init__(self, root: Any, config: Config, on_change: Optional[Callable[[], None]]) -> None:
+        self.root = root
         self.config = config
         self.on_change = on_change
-        self.root: Any = None
 
-    def run(self) -> None:
-        with SettingsDialog._lock:
-            if SettingsDialog._open:
-                log.info("Settings dialog already open")
-                return
-            SettingsDialog._open = True
-        try:
-            self._build_and_run()
-        except Exception as exc:
-            log.warning("Settings GUI error: %s", exc)
-        finally:
-            with SettingsDialog._lock:
-                SettingsDialog._open = False
-
-    def _build_and_run(self) -> None:
+    def show(self) -> None:
+        """Build and show the settings dialog as a modal Toplevel."""
         import tkinter as tk
         from tkinter import ttk
 
-        root = tk.Tk()
-        self.root = root
-        root.title("Teams Keepalive - Settings")
-        root.resizable(False, False)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Teams Keepalive - Settings")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
 
         interval_var = tk.IntVar(value=int(self.config.get("interval", 60)))
         jitter_var = tk.BooleanVar(value=bool(self.config.get("randomized_jitter", True)))
@@ -552,9 +546,8 @@ class SettingsDialog:
         wh_start_var = tk.StringVar(value=str(self.config.get("work_start", "09:00")))
         wh_end_var = tk.StringVar(value=str(self.config.get("work_end", "17:00")))
         stop_times: List[str] = list(self.config.get("stop_times", []))
-        stop_list_var = tk.StringVar(value=self._stop_list_text(stop_times))
 
-        notebook = ttk.Notebook(root)
+        notebook = ttk.Notebook(dlg)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
         # --- Tab 1: Activity ---
@@ -594,7 +587,6 @@ class SettingsDialog:
             listbox.delete(0, tk.END)
             for s in stop_times:
                 listbox.insert(tk.END, s)
-            stop_list_var.set(self._stop_list_text(stop_times))
         refresh_listbox()
 
         ttk.Label(tab2, text="Add (HH:MM):").grid(row=1, column=1, sticky="w", padx=4)
@@ -635,7 +627,7 @@ class SettingsDialog:
             row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 8))
 
         # --- Bottom buttons ---
-        btn_frame = ttk.Frame(root)
+        btn_frame = ttk.Frame(dlg)
         btn_frame.pack(fill="x", padx=8, pady=8)
 
         def apply_changes() -> None:
@@ -665,41 +657,39 @@ class SettingsDialog:
         def on_apply() -> None:
             apply_changes()
             err_label.config(text="Saved.")
-            root.after(1500, lambda: err_label.config(text=""))
+            dlg.after(1500, lambda: err_label.config(text=""))
 
         def on_ok() -> None:
             apply_changes()
-            root.destroy()
+            dlg.destroy()
 
         def on_cancel() -> None:
-            root.destroy()
+            dlg.destroy()
 
         ttk.Button(btn_frame, text="Apply", command=on_apply).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=4)
-        root.mainloop()
 
-    @staticmethod
-    def _stop_list_text(times: List[str]) -> str:
-        return ", ".join(times)
-
-
-def open_settings(config: Config, on_change: Optional[Callable[[], None]] = None) -> None:
-    """Launch the settings GUI.
-
-    Must be called from the main thread (the pystray callback thread).
-    tkinter is NOT thread-safe on Windows; creating Tk() in a secondary
-    thread results in unresponsive widgets. Calling this from the tray
-    callback (which runs in the main thread) ensures the GUI works.
-    The tray icon pauses while the dialog is open (modal behavior).
-    """
-    SettingsDialog(config, on_change).run()
+        # Center the dialog on screen
+        dlg.update_idletasks()
+        x = (dlg.winfo_screenwidth() - dlg.winfo_width()) // 2
+        y = (dlg.winfo_screenheight() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
 
 # ---------------------------------------------------------------------------
 # Core keepalive app
 # ---------------------------------------------------------------------------
 class KeepaliveApp:
+    """Owns the config, input controller, scheduler thread, tray, and tk root.
+
+    Architecture:
+      - Main thread: runs tk.Tk().mainloop() (the hidden root).
+      - Daemon thread: runs pystray icon.run() (tray event loop).
+      - Daemon thread: runs _scheduler_loop() (activity jiggles).
+      - Tray callbacks: schedule UI work via root.after(0, callback).
+    """
+
     def __init__(self) -> None:
         self.config = Config()
         self.input = InputController()
@@ -715,19 +705,38 @@ class KeepaliveApp:
         self._tray_icon_grey: bytes = make_paused_icon()
         self._stop_lock = threading.Lock()
         self._current_stop_target: Optional[datetime] = None
+        self._root: Any = None  # tk.Tk instance (hidden)
         self._recompute_stop_target()
 
     def start(self) -> None:
         log.info("Teams Keepalive v%s starting", APP_VERSION)
+
+        # Create the hidden tk.Tk root in the main thread.
+        # This owns the mainloop and all tkinter windows.
+        import tkinter as tk
+        self._root = tk.Tk()
+        self._root.withdraw()  # hide the root window
+
+        # Start the hotkey listener (if enabled).
         if self.config.get("hotkey_enabled", True):
             self._start_hotkey_listener()
+
+        # Start the scheduler thread (activity jiggles).
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop, name="keepalive-scheduler", daemon=True)
         self._scheduler_thread.start()
-        self._run_tray()
 
-    def stop(self) -> None:
-        log.info("Stopping Teams Keepalive")
+        # Start the tray icon in a daemon thread.
+        # On Windows, pystray can safely run in a non-main thread.
+        self._start_tray_thread()
+
+        # Run the tkinter mainloop in the main thread.
+        # This blocks until self._root is destroyed.
+        log.info("Entering tkinter mainloop (main thread)")
+        self._root.mainloop()
+        log.info("Tkinter mainloop exited; cleaning up")
+
+        # Cleanup after mainloop exits.
         self.running.clear()
         try:
             if self._hotkey_listener is not None:
@@ -740,6 +749,36 @@ class KeepaliveApp:
         except Exception:
             pass
 
+    def _start_tray_thread(self) -> None:
+        """Start pystray icon.run() in a daemon thread."""
+        def run_tray() -> None:
+            try:
+                import pystray
+                from PIL import Image as PilImage
+                import io
+
+                green_img = PilImage.open(io.BytesIO(self._tray_icon_green))
+                grey_img = PilImage.open(io.BytesIO(self._tray_icon_grey))
+                self._tray_icon_green_img = green_img
+                self._tray_icon_grey_img = grey_img
+
+                icon = pystray.Icon(
+                    APP_NAME, icon=green_img, title=APP_NAME, menu=self._build_menu())
+                self._tray = icon
+                log.info("Tray icon created; entering tray loop")
+                icon.run()
+                log.info("Tray loop exited")
+            except Exception as exc:
+                log.error("Tray icon failed: %s", exc, exc_info=True)
+                self._root.after(0, lambda: self._show_error_dialog(
+                    "Teams Keep-Alive - Tray Error",
+                    ("Failed to create the system tray icon.\n\n"
+                     "Error: {}\n\nCheck the log file at:\n  {}").format(exc, LOG_PATH_IN_USE)))
+
+        t = threading.Thread(target=run_tray, name="keepalive-tray", daemon=True)
+        t.start()
+
+    # -- pause/resume ------------------------------------------------------
     def _set_paused(self, paused: bool, reason: str) -> None:
         was = self.paused.is_set()
         self.paused.set() if paused else self.paused.clear()
@@ -756,6 +795,7 @@ class KeepaliveApp:
         else:
             self._set_paused(True, reason)
 
+    # -- hotkey ------------------------------------------------------------
     def _start_hotkey_listener(self) -> None:
         def run_listener() -> None:
             try:
@@ -775,6 +815,7 @@ class KeepaliveApp:
             return
         self.toggle_pause(reason="hotkey")
 
+    # -- scheduler ---------------------------------------------------------
     def _recompute_stop_target(self) -> None:
         with self._stop_lock:
             stops = list(self.config.get("stop_times", []))
@@ -825,12 +866,12 @@ class KeepaliveApp:
         end = time.monotonic() + seconds
         while self.running.is_set() and time.monotonic() < end:
             if self.paused.is_set():
-                return
+                return  # paused - return immediately
             with self._stop_lock:
                 target = self._current_stop_target
             if target is not None and datetime.now() >= target:
-                return
-            time.sleep(min(1.0, end - time.monotonic() + 1e-3))
+                return  # stop time arrived - return so main loop triggers it
+            time.sleep(min(1.0, end - time.monotonic() + 1e-3))  # check every 1s
 
     def _sleep_until_work_boundary(self, start: str, end: str) -> None:
         boundary = next_work_boundary_datetime(start, end)
@@ -843,38 +884,7 @@ class KeepaliveApp:
                 break
             time.sleep(min(5.0, max(0.5, remaining)))
 
-    def _run_tray(self) -> None:
-        try:
-            import pystray
-            from PIL import Image as PilImage
-        except Exception as exc:
-            log.error("pystray/PIL unavailable; cannot create tray icon: %s", exc)
-            self._show_error_dialog(
-                "Teams Keep-Alive - Cannot Start",
-                ("Failed to load the system tray library (pystray/Pillow).\n\n"
-                 "Error: {}\n\nPlease install dependencies:\n"
-                 "  pip install pystray Pillow pynput\n\nThe app will now exit.").format(exc))
-            return
-
-        try:
-            import io
-            green_img = PilImage.open(io.BytesIO(self._tray_icon_green))
-            grey_img = PilImage.open(io.BytesIO(self._tray_icon_grey))
-            self._tray_icon_green_img = green_img
-            self._tray_icon_grey_img = grey_img
-
-            icon = pystray.Icon(APP_NAME, icon=green_img, title=APP_NAME, menu=self._build_menu())
-            self._tray = icon
-            log.info("Tray icon created; entering main loop")
-            icon.run()
-        except Exception as exc:
-            log.error("Tray icon creation failed: %s", exc, exc_info=True)
-            self._show_error_dialog(
-                "Teams Keep-Alive - Tray Error",
-                ("Failed to create the system tray icon.\n\n"
-                 "Error: {}\n\nCheck the log file at:\n  {}\n\n"
-                 "The app will now exit.").format(exc, LOG_PATH_IN_USE))
-
+    # -- tray --------------------------------------------------------------
     def _build_menu(self) -> Any:
         import pystray
         interval = int(self.config.get("interval", 60))
@@ -918,6 +928,7 @@ class KeepaliveApp:
             except Exception:
                 pass
 
+    # -- tray callbacks (run in pystray thread; schedule UI via root.after) --
     def _on_cycle_interval(self, icon: Any, item: Any) -> None:
         current = int(self.config.get("interval", 60))
         if current in INTERVAL_PRESETS:
@@ -934,7 +945,12 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_open_settings(self, icon: Any, item: Any) -> None:
-        open_settings(self.config, on_change=self._on_settings_changed)
+        # Schedule the settings dialog on the main thread.
+        self._root.after(0, self._show_settings)
+
+    def _show_settings(self) -> None:
+        """Called on the main thread via root.after()."""
+        SettingsDialog(self._root, self.config, on_change=self._on_settings_changed).show()
 
     def _on_settings_changed(self) -> None:
         hotkey_enabled = bool(self.config.get("hotkey_enabled", True))
@@ -950,7 +966,14 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_quit(self, icon: Any, item: Any) -> None:
-        self.stop()
+        # Schedule destruction of the tk root on the main thread.
+        # This causes mainloop() to exit, which lets the app clean up and exit.
+        self._root.after(0, self._do_quit)
+
+    def _do_quit(self) -> None:
+        """Called on the main thread via root.after()."""
+        log.info("Quit requested; destroying root")
+        self._root.destroy()
 
     def _on_open_log(self, icon: Any, item: Any) -> None:
         log_path = LOG_PATH_IN_USE if LOG_PATH_IN_USE else LOG_PATH
@@ -1022,7 +1045,7 @@ def main() -> None:
         app.start()
     except KeyboardInterrupt:
         log.info("Interrupted by user")
-        app.stop()
+        app.running.clear()
     except Exception as exc:
         log.error("Fatal error in main loop: %s", exc, exc_info=True)
         KeepaliveApp._show_error_dialog(
