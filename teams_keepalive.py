@@ -66,6 +66,8 @@ APP_VERSION: str = "2.0"
 APP_DIR: str = os.path.join(os.path.expanduser("~"), ".teams_keepalive")
 CONFIG_PATH: str = os.path.join(APP_DIR, "config.json")
 LOG_PATH: str = os.path.join(APP_DIR, "keepalive.log")
+# Fallback log path if the app directory is not writable.
+LOG_PATH_FALLBACK: str = os.path.join(os.path.expanduser("~"), "keepalive.log")
 
 # Tray green/grey icons are generated as PNG byte strings.
 HOTKEY_TOGGLE: str = "<ctrl>+<shift>+k"
@@ -99,27 +101,92 @@ log: logging.Logger = logging.getLogger(APP_NAME)
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-def setup_logging() -> None:
-    """Configure rotating file logging to ~/.teams_keepalive/keepalive.log."""
+def _ensure_app_dir() -> bool:
+    """Create the app data directory. Returns True on success."""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        return True
     except OSError:
-        pass
+        return False
+
+
+def setup_logging() -> None:
+    """Configure rotating file logging to ~/.teams_keepalive/keepalive.log.
+
+    Falls back to ~/keepalive.log if the app directory is not writable.
+    Falls back to stderr if no file is writable (useful when a console exists).
+    With pythonw.exe (no console), file logging is the only option, so we
+    try hard to make it work.
+    """
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     # Avoid duplicate handlers on re-init.
-    if not any(isinstance(h, logging.handlers.RotatingFileHandler)
-               and getattr(h, "_keepalive", False) for h in root.handlers):
+    if any(getattr(h, "_keepalive", False) for h in root.handlers):
+        return
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s")
+
+    handler = None
+    log_path_used = None
+
+    # Try the primary log path first.
+    _ensure_app_dir()
+    for candidate_path in (LOG_PATH, LOG_PATH_FALLBACK):
         try:
             handler = logging.handlers.RotatingFileHandler(
-                LOG_PATH, maxBytes=512 * 1024, backupCount=3, encoding="utf-8")
-        except OSError:
-            # Fallback to console if file logging unavailable.
-            handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s"))
-        handler._keepalive = True  # type: ignore[attr-defined]
-        root.addHandler(handler)
+                candidate_path, maxBytes=512 * 1024,
+                backupCount=3, encoding="utf-8")
+            log_path_used = candidate_path
+            break
+        except Exception:
+            handler = None
+            continue
+
+    if handler is None:
+        # Last resort: plain FileHandler without rotation.
+        for candidate_path in (LOG_PATH, LOG_PATH_FALLBACK):
+            try:
+                handler = logging.FileHandler(
+                    candidate_path, mode="a", encoding="utf-8")
+                log_path_used = candidate_path
+                break
+            except Exception:
+                handler = None
+                continue
+
+    if handler is None:
+        # Absolute last resort: StreamHandler (only useful with a console).
+        handler = logging.StreamHandler()
+    else:
+        # Store the log path for reference in diagnostics.
+        global LOG_PATH_IN_USE
+        LOG_PATH_IN_USE = log_path_used
+
+    handler.setFormatter(formatter)
+    handler._keepalive = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+
+    # Force-flush so the file appears on disk immediately.
+    try:
+        handler.flush()
+    except Exception:
+        pass
+
+    # Log the startup banner so the user can confirm the file exists.
+    log.info("=" * 50)
+    log.info("Teams Keepalive logging initialized")
+    if log_path_used:
+        log.info("Log file: %s", log_path_used)
+    else:
+        log.info("WARNING: file logging failed; using StreamHandler (stderr)")
+    log.info("App dir: %s", APP_DIR)
+    log.info("=" * 50)
+
+
+# Path where the log file was actually created (may differ from LOG_PATH
+# if the primary location was not writable).
+LOG_PATH_IN_USE: str = LOG_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -956,8 +1023,9 @@ class KeepaliveApp:
                 "Teams Keep-Alive - Tray Error",
                 ("Failed to create the system tray icon.\n\n"
                  "Error: {}\n\n"
-                 "Check the log file at ~/.teams_keepalive/keepalive.log\n"
-                 "The app will now exit.").format(exc)
+                 "Check the log file at:\n"
+                 "  {}\n\n"
+                 "The app will now exit.").format(exc, LOG_PATH_IN_USE)
             )
 
     def _build_menu(self) -> Any:
@@ -973,6 +1041,7 @@ class KeepaliveApp:
                 self._on_cycle_interval),
             pystray.MenuItem("Pause / Resume", self._on_toggle_pause),
             pystray.MenuItem("Settings...", self._on_open_settings),
+            pystray.MenuItem("Open log file", self._on_open_log),
             pystray.MenuItem("Quit", self._on_quit),
         ]
         return pystray.Menu(*menu_items)
@@ -1040,6 +1109,22 @@ class KeepaliveApp:
     def _on_quit(self, icon: Any, item: Any) -> None:
         self.stop()
 
+    def _on_open_log(self, icon: Any, item: Any) -> None:
+        """Open the log file in the default text editor."""
+        log_path = LOG_PATH_IN_USE if LOG_PATH_IN_USE else LOG_PATH
+        if not os.path.exists(log_path):
+            log.warning("Log file not found: %s", log_path)
+            return
+        try:
+            if IS_WINDOWS:
+                os.startfile(log_path)  # type: ignore[attr-defined]
+            elif IS_MACOS:
+                subprocess.run(["open", log_path], check=False)
+            else:
+                subprocess.run(["xdg-open", log_path], check=False)
+        except Exception as exc:
+            log.warning("Could not open log file: %s", exc)
+
     @staticmethod
     def _show_error_dialog(title: str, message: str) -> None:
         """Show a modal error dialog (tkinter). Works even without a tray icon."""
@@ -1092,7 +1177,8 @@ def main() -> None:
             "Teams Keep-Alive - Startup Error",
             ("Failed to initialize the app.\n\n"
              "Error: {}\n\n"
-             "Check the log file at ~/.teams_keepalive/keepalive.log").format(exc)
+             "Check the log file at:\n"
+             "  {}").format(exc, LOG_PATH_IN_USE)
         )
         sys.exit(1)
 
@@ -1107,7 +1193,8 @@ def main() -> None:
             "Teams Keep-Alive - Fatal Error",
             ("The app crashed:\n\n"
              "Error: {}\n\n"
-             "Check the log file at ~/.teams_keepalive/keepalive.log").format(exc)
+             "Check the log file at:\n"
+             "  {}").format(exc, LOG_PATH_IN_USE)
         )
         sys.exit(1)
 
