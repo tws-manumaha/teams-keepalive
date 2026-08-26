@@ -20,7 +20,7 @@ Features (v2.0):
   - Randomized jitter (+/-15% of interval; default ON)
   - Work hours mode (only run between start/end time; default OFF)
   - Wayland native support (ydotool, fallback F15 only)
-  - Settings GUI (tkinter, separate thread, tabbed sections)
+  - Settings GUI (tkinter, tabbed sections)
   - Lock-screen aware: skips mouse jiggle when screen is locked (F15 only)
 
 Python 3.8+ compatible.
@@ -48,7 +48,6 @@ IS_WINDOWS: bool = sys.platform.startswith("win")
 IS_MACOS: bool = sys.platform == "darwin"
 IS_LINUX: bool = sys.platform.startswith("linux")
 
-# Wayland detection (Linux only). Check XDG_SESSION_TYPE and WAYLAND_DISPLAY.
 _IS_WAYLAND: bool = False
 if IS_LINUX:
     _session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -62,20 +61,15 @@ if IS_LINUX:
 APP_NAME: str = "Teams Keep-Alive"
 APP_VERSION: str = "2.0"
 
-# App data directory and files.
 APP_DIR: str = os.path.join(os.path.expanduser("~"), ".teams_keepalive")
 CONFIG_PATH: str = os.path.join(APP_DIR, "config.json")
 LOG_PATH: str = os.path.join(APP_DIR, "keepalive.log")
-# Fallback log path if the app directory is not writable.
 LOG_PATH_FALLBACK: str = os.path.join(os.path.expanduser("~"), "keepalive.log")
 
-# Tray green/grey icons are generated as PNG byte strings.
 HOTKEY_TOGGLE: str = "<ctrl>+<shift>+k"
 
-# Cycle presets for the interval menu (seconds).
 INTERVAL_PRESETS: List[int] = [60, 120, 180, 300, 600]
 
-# Tray color labels for presets.
 INTERVAL_LABELS: Dict[int, str] = {
     60: "1 min",
     120: "2 min",
@@ -84,13 +78,12 @@ INTERVAL_LABELS: Dict[int, str] = {
     600: "10 min",
 }
 
-# Default config.
 DEFAULT_CONFIG: Dict[str, Any] = {
     "interval": 60,
-    "stop_times": [],          # list of "HH:MM" strings
+    "stop_times": [],
     "work_hours_enabled": False,
-    "work_start": "09:00",     # "HH:MM"
-    "work_end": "17:00",       # "HH:MM"
+    "work_start": "09:00",
+    "work_end": "17:00",
     "randomized_jitter": True,
     "hotkey_enabled": True,
 }
@@ -102,7 +95,6 @@ log: logging.Logger = logging.getLogger(APP_NAME)
 # Logging
 # ---------------------------------------------------------------------------
 def _ensure_app_dir() -> bool:
-    """Create the app data directory. Returns True on success."""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         return True
@@ -111,32 +103,20 @@ def _ensure_app_dir() -> bool:
 
 
 def setup_logging() -> None:
-    """Configure rotating file logging to ~/.teams_keepalive/keepalive.log.
-
-    Falls back to ~/keepalive.log if the app directory is not writable.
-    Falls back to stderr if no file is writable (useful when a console exists).
-    With pythonw.exe (no console), file logging is the only option, so we
-    try hard to make it work.
-    """
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    # Avoid duplicate handlers on re-init.
     if any(getattr(h, "_keepalive", False) for h in root.handlers):
         return
 
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s")
-
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     handler = None
     log_path_used = None
 
-    # Try the primary log path first.
     _ensure_app_dir()
     for candidate_path in (LOG_PATH, LOG_PATH_FALLBACK):
         try:
             handler = logging.handlers.RotatingFileHandler(
-                candidate_path, maxBytes=512 * 1024,
-                backupCount=3, encoding="utf-8")
+                candidate_path, maxBytes=512 * 1024, backupCount=3, encoding="utf-8")
             log_path_used = candidate_path
             break
         except Exception:
@@ -144,11 +124,9 @@ def setup_logging() -> None:
             continue
 
     if handler is None:
-        # Last resort: plain FileHandler without rotation.
         for candidate_path in (LOG_PATH, LOG_PATH_FALLBACK):
             try:
-                handler = logging.FileHandler(
-                    candidate_path, mode="a", encoding="utf-8")
+                handler = logging.FileHandler(candidate_path, mode="a", encoding="utf-8")
                 log_path_used = candidate_path
                 break
             except Exception:
@@ -156,10 +134,8 @@ def setup_logging() -> None:
                 continue
 
     if handler is None:
-        # Absolute last resort: StreamHandler (only useful with a console).
         handler = logging.StreamHandler()
     else:
-        # Store the log path for reference in diagnostics.
         global LOG_PATH_IN_USE
         LOG_PATH_IN_USE = log_path_used
 
@@ -167,13 +143,11 @@ def setup_logging() -> None:
     handler._keepalive = True  # type: ignore[attr-defined]
     root.addHandler(handler)
 
-    # Force-flush so the file appears on disk immediately.
     try:
         handler.flush()
     except Exception:
         pass
 
-    # Log the startup banner so the user can confirm the file exists.
     log.info("=" * 50)
     log.info("Teams Keepalive logging initialized")
     if log_path_used:
@@ -184,8 +158,6 @@ def setup_logging() -> None:
     log.info("=" * 50)
 
 
-# Path where the log file was actually created (may differ from LOG_PATH
-# if the primary location was not writable).
 LOG_PATH_IN_USE: str = LOG_PATH
 
 
@@ -193,8 +165,6 @@ LOG_PATH_IN_USE: str = LOG_PATH
 # Config persistence
 # ---------------------------------------------------------------------------
 class Config:
-    """Thread-safe config persistence to config.json."""
-
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._data: Dict[str, Any] = dict(DEFAULT_CONFIG)
@@ -206,7 +176,6 @@ class Config:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, dict):
-                    # Merge with defaults so missing keys are filled in.
                     merged = dict(DEFAULT_CONFIG)
                     merged.update(data)
                     self._data = merged
@@ -247,8 +216,6 @@ class Config:
 # Input simulation
 # ---------------------------------------------------------------------------
 class InputController:
-    """Abstract-ish input controller. Picks a backend per platform/session."""
-
     def __init__(self) -> None:
         self.backend: str = "unknown"
         self._init_backend()
@@ -271,109 +238,73 @@ class InputController:
 
     @staticmethod
     def _has_ydotool() -> bool:
-        """Return True if ydotool is callable via subprocess."""
         try:
-            subprocess.run(["ydotool", "--version"],
-                            capture_output=True, check=False, timeout=5)
+            subprocess.run(["ydotool", "--version"], capture_output=True, check=False, timeout=5)
             return True
         except (FileNotFoundError, OSError):
             return False
 
-    # -- public API --------------------------------------------------------
     def jiggle(self) -> None:
-        """Perform one minimal-activity event (key + optional mouse).
-
-        When the screen is locked (Windows) or screensaver is active,
-        only the F15 keypress is sent. Mouse jiggle is skipped because
-        SetCursorPos wakes the Windows lock screen, causing the login
-        screen to flash on every cycle.
-        """
         try:
             self._press_keepalive_key()
-            # Skip mouse jiggle if the screen is locked or screensaver active.
             if self._is_screen_locked():
                 log.debug("Screen locked; skipping mouse jiggle (F15 only)")
                 return
             self._jiggle_mouse()
-        except Exception as exc:  # never let input errors kill the loop
+        except Exception as exc:
             log.warning("Input jiggle failed: %s", exc)
 
     @staticmethod
     def _is_screen_locked() -> bool:
-        """Return True if the screen is locked or screensaver is running.
-
-        On Windows: uses OpenInputDesktop + SwitchDesktop to detect lock.
-        On macOS/Linux: returns False (those platforms typically do not
-        wake the screen the way Windows does).
-        Returns False if detection fails (safe default = jiggle anyway).
-        """
         if IS_WINDOWS:
             return InputController._win_is_locked()
         return False
 
     @staticmethod
     def _win_is_locked() -> bool:
-        """Detect if the Windows workstation is locked.
-
-        Uses the OpenInputDesktop/SwitchDesktop technique: when the
-        workstation is locked, SwitchDesktop returns False.
-        Also checks for the LogonUI process as a fallback.
-        """
         try:
             import ctypes
-
             DESKTOP_SWITCHDESKTOP = 0x0100
-            # Try to open the current input desktop.
-            hDesktop = ctypes.windll.user32.OpenInputDesktop(
-                0, False, DESKTOP_SWITCHDESKTOP)
+            hDesktop = ctypes.windll.user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
             if hDesktop:
-                # Can we switch to it? If not, workstation is locked.
                 result = ctypes.windll.user32.SwitchDesktop(hDesktop)
                 ctypes.windll.user32.CloseDesktop(hDesktop)
                 if not result:
-                    return True  # locked
-                # Also check if screensaver is running.
+                    return True
                 return InputController._win_screensaver_running()
             else:
-                # Could not open input desktop; try the Default desktop.
-                hDesktop = ctypes.windll.user32.OpenDesktopW(
-                    "Default", 0, False, DESKTOP_SWITCHDESKTOP)
+                hDesktop = ctypes.windll.user32.OpenDesktopW("Default", 0, False, DESKTOP_SWITCHDESKTOP)
                 if hDesktop:
                     result = ctypes.windll.user32.SwitchDesktop(hDesktop)
                     ctypes.windll.user32.CloseDesktop(hDesktop)
                     if not result:
-                        return True  # locked
-                return True  # can't open any desktop = probably locked
+                        return True
+                return True
         except Exception as exc:
             log.debug("Lock detection failed: %s", exc)
-            # Check for LogonUI process as fallback.
             try:
                 import subprocess
                 result = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq logonui.exe",
-                     "/NH"],
+                    ["tasklist", "/FI", "IMAGENAME eq logonui.exe", "/NH"],
                     capture_output=True, text=True, timeout=5)
                 if "logonui.exe" in result.stdout.lower():
                     return True
             except Exception:
                 pass
-            return False  # detection failed; assume not locked
+            return False
 
     @staticmethod
     def _win_screensaver_running() -> bool:
-        """Check if the Windows screensaver is currently running."""
         try:
             import ctypes
             SPI_GETSCREENSAVERRUNNING = 114
             running = ctypes.wintypes.BOOL(False)
             ctypes.windll.user32.SystemParametersInfoW(
-                SPI_GETSCREENSAVERRUNNING, 0,
-                ctypes.byref(running), 0)
+                SPI_GETSCREENSAVERRUNNING, 0, ctypes.byref(running), 0)
             return bool(running.value)
         except Exception:
             return False
 
-    # -- key ---------------------------------------------------------------
     def _press_keepalive_key(self) -> None:
         if IS_WINDOWS:
             self._win_press_f15()
@@ -382,8 +313,7 @@ class InputController:
 
     @staticmethod
     def _win_press_f15() -> None:
-        import ctypes  # local import; Windows-only
-
+        import ctypes
         VK_F15 = 0x7E
         KEYEVENTF_KEYUP = 0x0002
         ctypes.windll.user32.keybd_event(VK_F15, 0, 0, 0)
@@ -402,38 +332,30 @@ class InputController:
         except Exception as exc:
             log.warning("pynput F15 keypress failed: %s", exc)
 
-    # -- mouse -------------------------------------------------------------
     def _jiggle_mouse(self) -> None:
         if IS_WINDOWS:
             self._win_jiggle_mouse()
         elif self.backend == "wayland-ydotool":
             self._ydotool_jiggle_mouse()
         elif self.backend == "wayland-f15-only":
-            return  # skip mouse on Wayland without ydotool
+            return
         else:
             self._pynput_jiggle_mouse()
 
     @staticmethod
     def _win_jiggle_mouse() -> None:
         import ctypes
-
         user32 = ctypes.windll.user32
         point = ctypes.wintypes.POINT()
-        # Read current cursor position.
         user32.GetCursorPos(ctypes.byref(point))
-        # Move 1 pixel right then back.
         user32.SetCursorPos(point.x + 1, point.y)
         user32.SetCursorPos(point.x, point.y)
 
     @staticmethod
     def _ydotool_jiggle_mouse() -> None:
         try:
-            subprocess.run(
-                ["ydotool", "move", "--", "1", "0"],
-                capture_output=True, check=False, timeout=5)
-            subprocess.run(
-                ["ydotool", "move", "--", "-1", "0"],
-                capture_output=True, check=False, timeout=5)
+            subprocess.run(["ydotool", "move", "--", "1", "0"], capture_output=True, check=False, timeout=5)
+            subprocess.run(["ydotool", "move", "--", "-1", "0"], capture_output=True, check=False, timeout=5)
         except (FileNotFoundError, OSError) as exc:
             log.warning("ydotool mouse jiggle failed: %s", exc)
 
@@ -456,7 +378,6 @@ class InputController:
 # Tray icon images
 # ---------------------------------------------------------------------------
 def _solid_circle_png(hex_color: str) -> bytes:
-    """Return a PNG byte string of a solid colored circle with letter K."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception:
@@ -478,8 +399,7 @@ def _solid_circle_png(hex_color: str) -> bytes:
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     except Exception:
         tw, th = 20, 24
-    draw.text(((size - tw) / 2, (size - th) / 2 - 2), text,
-              fill="white", font=font)
+    draw.text(((size - tw) / 2, (size - th) / 2 - 2), text, fill="white", font=font)
     import io
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -487,7 +407,6 @@ def _solid_circle_png(hex_color: str) -> bytes:
 
 
 def _fallback_png(hex_color: str) -> bytes:
-    """Tiny 1x1 PNG as last-resort icon."""
     h = hex_color.lstrip("#")
     if len(h) == 6:
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -495,7 +414,6 @@ def _fallback_png(hex_color: str) -> bytes:
         r, g, b = 0, 200, 0
     import struct, zlib
     sig = b"\x89PNG\r\n\x1a\n"
-
     def chunk(tag: bytes, data: bytes) -> bytes:
         c = struct.pack(">I", len(data)) + tag + data
         crc = struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
@@ -518,7 +436,6 @@ def make_paused_icon() -> bytes:
 # Scheduler logic helpers
 # ---------------------------------------------------------------------------
 def parse_hhmm(s: str) -> Optional[dtime]:
-    """Parse "HH:MM" into a datetime.time. Returns None on failure."""
     try:
         parts = s.strip().split(":")
         if len(parts) != 2:
@@ -532,15 +449,7 @@ def now_time() -> dtime:
     return datetime.now().time()
 
 
-def next_stop_datetime(stop_times: List[str], now: Optional[datetime] = None
-                       ) -> Optional[datetime]:
-    """Return the nearest upcoming stop datetime from a list of "HH:MM".
-
-    None if the list is empty. If any times are in the future today, the
-    nearest one is returned. If all times are in the past today, the most
-    recent past time is returned so it triggers immediately (instead of
-    silently rolling to tomorrow and never stopping).
-    """
+def next_stop_datetime(stop_times: List[str], now: Optional[datetime] = None) -> Optional[datetime]:
     if not stop_times:
         return None
     if now is None:
@@ -558,22 +467,18 @@ def next_stop_datetime(stop_times: List[str], now: Optional[datetime] = None
     if future_today:
         return min(future_today)
     if all_today:
-        return max(all_today)  # most recent past time -> triggers now
+        return max(all_today)
     return None
 
 
-def remove_past_or_matching_stop(stop_times: List[str],
-                                 target: Optional[datetime]) -> List[str]:
-    """Return a new list with the stop time matching `target` removed."""
+def remove_past_or_matching_stop(stop_times: List[str], target: Optional[datetime]) -> List[str]:
     if target is None:
         return list(stop_times)
     target_str = target.strftime("%H:%M")
     return [s for s in stop_times if s.strip() != target_str]
 
 
-def is_within_work_hours(start: str, end: str,
-                         now: Optional[datetime] = None) -> bool:
-    """Return True if `now` is within [start, end) work hours."""
+def is_within_work_hours(start: str, end: str, now: Optional[datetime] = None) -> bool:
     if now is None:
         now = datetime.now()
     st = parse_hhmm(start)
@@ -589,10 +494,7 @@ def is_within_work_hours(start: str, end: str,
         return True
 
 
-def next_work_boundary_datetime(start: str, end: str,
-                                now: Optional[datetime] = None
-                                ) -> Optional[datetime]:
-    """Return the next datetime the work-hours state flips."""
+def next_work_boundary_datetime(start: str, end: str, now: Optional[datetime] = None) -> Optional[datetime]:
     if now is None:
         now = datetime.now()
     st = parse_hhmm(start)
@@ -609,16 +511,13 @@ def next_work_boundary_datetime(start: str, end: str,
 
 
 # ---------------------------------------------------------------------------
-# Settings GUI (tkinter, runs in its own thread)
+# Settings GUI (tkinter)
 # ---------------------------------------------------------------------------
 class SettingsDialog:
-    """Tkinter settings dialog with sections for all v2.0 options."""
-
     _lock = threading.Lock()
     _open = False
 
-    def __init__(self, config: Config, on_change: Optional[Callable[[], None]]
-                 ) -> None:
+    def __init__(self, config: Config, on_change: Optional[Callable[[], None]]) -> None:
         self.config = config
         self.on_change = on_change
         self.root: Any = None
@@ -647,12 +546,9 @@ class SettingsDialog:
         root.resizable(False, False)
 
         interval_var = tk.IntVar(value=int(self.config.get("interval", 60)))
-        jitter_var = tk.BooleanVar(
-            value=bool(self.config.get("randomized_jitter", True)))
-        hotkey_var = tk.BooleanVar(
-            value=bool(self.config.get("hotkey_enabled", True)))
-        wh_enabled_var = tk.BooleanVar(
-            value=bool(self.config.get("work_hours_enabled", False)))
+        jitter_var = tk.BooleanVar(value=bool(self.config.get("randomized_jitter", True)))
+        hotkey_var = tk.BooleanVar(value=bool(self.config.get("hotkey_enabled", True)))
+        wh_enabled_var = tk.BooleanVar(value=bool(self.config.get("work_hours_enabled", False)))
         wh_start_var = tk.StringVar(value=str(self.config.get("work_start", "09:00")))
         wh_end_var = tk.StringVar(value=str(self.config.get("work_end", "17:00")))
         stop_times: List[str] = list(self.config.get("stop_times", []))
@@ -664,13 +560,10 @@ class SettingsDialog:
         # --- Tab 1: Activity ---
         tab1 = ttk.Frame(notebook)
         notebook.add(tab1, text="Activity")
-        ttk.Label(tab1, text="Ping interval (seconds):").grid(
-            row=0, column=0, sticky="w", padx=8, pady=8)
-        spin = tk.Spinbox(tab1, from_=10, to=3600, increment=10,
-                          textvariable=interval_var, width=8)
+        ttk.Label(tab1, text="Ping interval (seconds):").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        spin = tk.Spinbox(tab1, from_=10, to=3600, increment=10, textvariable=interval_var, width=8)
         spin.grid(row=0, column=1, padx=8, pady=8)
-        ttk.Label(tab1, text="Presets:").grid(row=1, column=0, sticky="w",
-                                              padx=8, pady=4)
+        ttk.Label(tab1, text="Presets:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         preset_frame = ttk.Frame(tab1)
         preset_frame.grid(row=1, column=1, padx=8, pady=4, sticky="w")
 
@@ -679,26 +572,20 @@ class SettingsDialog:
 
         col = 0
         for p in INTERVAL_PRESETS:
-            b = ttk.Button(preset_frame,
-                           text=INTERVAL_LABELS.get(p, f"{p}s"),
-                           command=lambda v=p: apply_preset(v))
+            b = ttk.Button(preset_frame, text=INTERVAL_LABELS.get(p, f"{p}s"), command=lambda v=p: apply_preset(v))
             b.grid(row=0, column=col, padx=2)
             col += 1
 
-        ttk.Checkbutton(tab1, text="Randomized jitter (+/-15%)",
-                        variable=jitter_var).grid(
+        ttk.Checkbutton(tab1, text="Randomized jitter (+/-15%)", variable=jitter_var).grid(
             row=2, column=0, columnspan=2, sticky="w", padx=8, pady=8)
-        ttk.Checkbutton(tab1, text="Enable global hotkey Ctrl+Shift+K",
-                        variable=hotkey_var).grid(
+        ttk.Checkbutton(tab1, text="Enable global hotkey Ctrl+Shift+K", variable=hotkey_var).grid(
             row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
         # --- Tab 2: Stop times ---
         tab2 = ttk.Frame(notebook)
         notebook.add(tab2, text="Stop times")
-        ttk.Label(tab2,
-                  text="Auto-stop at these times (nearest upcoming one is used):"
-                  ).grid(row=0, column=0, columnspan=3, sticky="w",
-                         padx=8, pady=(8, 4))
+        ttk.Label(tab2, text="Auto-stop at these times (nearest upcoming one is used):").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 4))
         listbox = tk.Listbox(tab2, height=8, width=12)
         listbox.grid(row=1, column=0, rowspan=3, padx=8, pady=4)
         new_time_var = tk.StringVar(value="12:00")
@@ -708,12 +595,10 @@ class SettingsDialog:
             for s in stop_times:
                 listbox.insert(tk.END, s)
             stop_list_var.set(self._stop_list_text(stop_times))
-
         refresh_listbox()
-        ttk.Label(tab2, text="Add (HH:MM):").grid(row=1, column=1, sticky="w",
-                                                  padx=4)
-        ttk.Entry(tab2, textvariable=new_time_var, width=8).grid(
-            row=2, column=1, padx=4)
+
+        ttk.Label(tab2, text="Add (HH:MM):").grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Entry(tab2, textvariable=new_time_var, width=8).grid(row=2, column=1, padx=4)
 
         def add_stop() -> None:
             val = new_time_var.get().strip()
@@ -722,8 +607,7 @@ class SettingsDialog:
                 return
             if val not in stop_times:
                 stop_times.append(val)
-                stop_times.sort(
-                    key=lambda s: parse_hhmm(s) or dtime(0, 0))
+                stop_times.sort(key=lambda s: parse_hhmm(s) or dtime(0, 0))
             err_label.config(text="")
             refresh_listbox()
 
@@ -733,31 +617,22 @@ class SettingsDialog:
                 del stop_times[sel[0]]
                 refresh_listbox()
 
-        ttk.Button(tab2, text="Add", command=add_stop).grid(
-            row=3, column=1, padx=4, sticky="ew")
-        ttk.Button(tab2, text="Remove", command=remove_stop).grid(
-            row=4, column=0, padx=8, pady=4, sticky="w")
+        ttk.Button(tab2, text="Add", command=add_stop).grid(row=3, column=1, padx=4, sticky="ew")
+        ttk.Button(tab2, text="Remove", command=remove_stop).grid(row=4, column=0, padx=8, pady=4, sticky="w")
         err_label = ttk.Label(tab2, text="", foreground="red")
         err_label.grid(row=5, column=0, columnspan=2, sticky="w", padx=8)
 
         # --- Tab 3: Work hours ---
         tab3 = ttk.Frame(notebook)
         notebook.add(tab3, text="Work hours")
-        ttk.Checkbutton(tab3, text="Only run during work hours",
-                        variable=wh_enabled_var).grid(
+        ttk.Checkbutton(tab3, text="Only run during work hours", variable=wh_enabled_var).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=8, pady=8)
-        ttk.Label(tab3, text="Start (HH:MM):").grid(
-            row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(tab3, textvariable=wh_start_var, width=8).grid(
-            row=1, column=1, padx=8, pady=4)
-        ttk.Label(tab3, text="End (HH:MM):").grid(
-            row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(tab3, textvariable=wh_end_var, width=8).grid(
-            row=2, column=1, padx=8, pady=4)
-        ttk.Label(tab3,
-                  text="Outside work hours the app auto-pauses; it resumes at start."
-                  ).grid(row=3, column=0, columnspan=2, sticky="w",
-                         padx=8, pady=(4, 8))
+        ttk.Label(tab3, text="Start (HH:MM):").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(tab3, textvariable=wh_start_var, width=8).grid(row=1, column=1, padx=8, pady=4)
+        ttk.Label(tab3, text="End (HH:MM):").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(tab3, textvariable=wh_end_var, width=8).grid(row=2, column=1, padx=8, pady=4)
+        ttk.Label(tab3, text="Outside work hours the app auto-pauses; it resumes at start.").grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(4, 8))
 
         # --- Bottom buttons ---
         btn_frame = ttk.Frame(root)
@@ -799,12 +674,9 @@ class SettingsDialog:
         def on_cancel() -> None:
             root.destroy()
 
-        ttk.Button(btn_frame, text="Apply", command=on_apply).pack(
-            side="left", padx=4)
-        ttk.Button(btn_frame, text="OK", command=on_ok).pack(
-            side="left", padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(
-            side="right", padx=4)
+        ttk.Button(btn_frame, text="Apply", command=on_apply).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=4)
         root.mainloop()
 
     @staticmethod
@@ -812,20 +684,22 @@ class SettingsDialog:
         return ", ".join(times)
 
 
-def open_settings_async(config: Config,
-                        on_change: Optional[Callable[[], None]] = None) -> None:
-    """Launch the settings GUI in its own thread."""
-    t = threading.Thread(target=lambda: SettingsDialog(config, on_change).run(),
-                         name="keepalive-settings", daemon=True)
-    t.start()
+def open_settings(config: Config, on_change: Optional[Callable[[], None]] = None) -> None:
+    """Launch the settings GUI.
+
+    Must be called from the main thread (the pystray callback thread).
+    tkinter is NOT thread-safe on Windows; creating Tk() in a secondary
+    thread results in unresponsive widgets. Calling this from the tray
+    callback (which runs in the main thread) ensures the GUI works.
+    The tray icon pauses while the dialog is open (modal behavior).
+    """
+    SettingsDialog(config, on_change).run()
 
 
 # ---------------------------------------------------------------------------
 # Core keepalive app
 # ---------------------------------------------------------------------------
 class KeepaliveApp:
-    """Owns the config, input controller, scheduler thread, and tray."""
-
     def __init__(self) -> None:
         self.config = Config()
         self.input = InputController()
@@ -848,8 +722,7 @@ class KeepaliveApp:
         if self.config.get("hotkey_enabled", True):
             self._start_hotkey_listener()
         self._scheduler_thread = threading.Thread(
-            target=self._scheduler_loop,
-            name="keepalive-scheduler", daemon=True)
+            target=self._scheduler_loop, name="keepalive-scheduler", daemon=True)
         self._scheduler_thread.start()
         self._run_tray()
 
@@ -888,8 +761,7 @@ class KeepaliveApp:
             try:
                 from pynput import keyboard
                 self._hotkey_listener = keyboard.GlobalHotKeyListener({
-                    HOTKEY_TOGGLE: lambda: self._on_hotkey()
-                })
+                    HOTKEY_TOGGLE: lambda: self._on_hotkey()})
                 self._hotkey_listener.start()
                 self._hotkey_listener.join()
             except Exception as exc:
@@ -909,11 +781,7 @@ class KeepaliveApp:
             self._current_stop_target = next_stop_datetime(stops)
 
     def _scheduler_loop(self) -> None:
-        """Main activity loop: jiggles at interval (+/-jitter), handles
-        stop times and work hours, sleeps in small slices so it can react
-        to config/pause changes quickly."""
         while self.running.is_set():
-            # Work hours check.
             if self.config.get("work_hours_enabled", False):
                 ws = str(self.config.get("work_start", "09:00"))
                 we = str(self.config.get("work_end", "17:00"))
@@ -926,10 +794,6 @@ class KeepaliveApp:
                     if self.paused.is_set() and self._pause_reason == "work_hours":
                         self._set_paused(False, "")
 
-            # Stop-time check.
-            # Recompute the target, then immediately check if it has arrived.
-            # next_stop_datetime returns past times as well (so they trigger
-            # immediately instead of rolling to tomorrow).
             self._recompute_stop_target()
             with self._stop_lock:
                 target = self._current_stop_target
@@ -942,17 +806,13 @@ class KeepaliveApp:
                 self._set_paused(True, "stop_time")
                 continue
 
-            # If paused (by stop_time, hotkey, or manual), just sleep briefly.
-            # The app stays in the tray but does NOT jiggle.
             if self.paused.is_set():
                 time.sleep(1.0)
                 continue
 
-            # Perform the activity jiggle.
             self.input.jiggle()
             log.info("Activity ping (interval=%ss)", self.config.get("interval", 60))
 
-            # Compute next sleep with optional jitter.
             interval = int(self.config.get("interval", 60))
             if self.config.get("randomized_jitter", True):
                 delta = interval * 0.15
@@ -962,19 +822,17 @@ class KeepaliveApp:
             self._interruptible_sleep(max(sleep_for, 1.0))
 
     def _interruptible_sleep(self, seconds: float) -> None:
-        """Sleep for `seconds`, waking every 1s to check running/pause/stop."""
         end = time.monotonic() + seconds
         while self.running.is_set() and time.monotonic() < end:
             if self.paused.is_set():
-                return  # paused - return immediately so main loop can handle it
+                return
             with self._stop_lock:
                 target = self._current_stop_target
             if target is not None and datetime.now() >= target:
-                return  # stop time arrived - return so main loop triggers it
+                return
             time.sleep(min(1.0, end - time.monotonic() + 1e-3))
 
     def _sleep_until_work_boundary(self, start: str, end: str) -> None:
-        """Sleep until the next work-hours boundary, in interruptible slices."""
         boundary = next_work_boundary_datetime(start, end)
         if boundary is None:
             time.sleep(5.0)
@@ -994,11 +852,8 @@ class KeepaliveApp:
             self._show_error_dialog(
                 "Teams Keep-Alive - Cannot Start",
                 ("Failed to load the system tray library (pystray/Pillow).\n\n"
-                 "Error: {}\n\n"
-                 "Please install dependencies:\n"
-                 "  pip install pystray Pillow pynput\n\n"
-                 "The app will now exit.").format(exc)
-            )
+                 "Error: {}\n\nPlease install dependencies:\n"
+                 "  pip install pystray Pillow pynput\n\nThe app will now exit.").format(exc))
             return
 
         try:
@@ -1008,12 +863,7 @@ class KeepaliveApp:
             self._tray_icon_green_img = green_img
             self._tray_icon_grey_img = grey_img
 
-            icon = pystray.Icon(
-                APP_NAME,
-                icon=green_img,
-                title=APP_NAME,
-                menu=self._build_menu(),
-            )
+            icon = pystray.Icon(APP_NAME, icon=green_img, title=APP_NAME, menu=self._build_menu())
             self._tray = icon
             log.info("Tray icon created; entering main loop")
             icon.run()
@@ -1022,23 +872,16 @@ class KeepaliveApp:
             self._show_error_dialog(
                 "Teams Keep-Alive - Tray Error",
                 ("Failed to create the system tray icon.\n\n"
-                 "Error: {}\n\n"
-                 "Check the log file at:\n"
-                 "  {}\n\n"
-                 "The app will now exit.").format(exc, LOG_PATH_IN_USE)
-            )
+                 "Error: {}\n\nCheck the log file at:\n  {}\n\n"
+                 "The app will now exit.").format(exc, LOG_PATH_IN_USE))
 
     def _build_menu(self) -> Any:
         import pystray
         interval = int(self.config.get("interval", 60))
         interval_label = INTERVAL_LABELS.get(interval, f"{interval}s")
         menu_items = [
-            pystray.MenuItem(
-                f"Status: {'Paused' if self.paused.is_set() else 'Active'}",
-                None, enabled=False),
-            pystray.MenuItem(
-                f"Interval: {interval_label}",
-                self._on_cycle_interval),
+            pystray.MenuItem(f"Status: {'Paused' if self.paused.is_set() else 'Active'}", None, enabled=False),
+            pystray.MenuItem(f"Interval: {interval_label}", self._on_cycle_interval),
             pystray.MenuItem("Pause / Resume", self._on_toggle_pause),
             pystray.MenuItem("Settings...", self._on_open_settings),
             pystray.MenuItem("Open log file", self._on_open_log),
@@ -1091,7 +934,7 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_open_settings(self, icon: Any, item: Any) -> None:
-        open_settings_async(self.config, on_change=self._on_settings_changed)
+        open_settings(self.config, on_change=self._on_settings_changed)
 
     def _on_settings_changed(self) -> None:
         hotkey_enabled = bool(self.config.get("hotkey_enabled", True))
@@ -1110,7 +953,6 @@ class KeepaliveApp:
         self.stop()
 
     def _on_open_log(self, icon: Any, item: Any) -> None:
-        """Open the log file in the default text editor."""
         log_path = LOG_PATH_IN_USE if LOG_PATH_IN_USE else LOG_PATH
         if not os.path.exists(log_path):
             log.warning("Log file not found: %s", log_path)
@@ -1127,7 +969,6 @@ class KeepaliveApp:
 
     @staticmethod
     def _show_error_dialog(title: str, message: str) -> None:
-        """Show a modal error dialog (tkinter). Works even without a tray icon."""
         try:
             import tkinter as tk
             from tkinter import messagebox
@@ -1157,9 +998,7 @@ def main() -> None:
             root.withdraw()
             messagebox.showerror(
                 "Teams Keep-Alive - Fatal Error",
-                "Cannot set up logging:\n{}\n\n"
-                "Make sure ~/.teams_keepalive/ is writable.".format(exc)
-            )
+                "Cannot set up logging:\n{}\n\nMake sure ~/.teams_keepalive/ is writable.".format(exc))
             root.destroy()
         except Exception:
             pass
@@ -1175,11 +1014,8 @@ def main() -> None:
         log.error("Failed to initialize app: %s", exc, exc_info=True)
         KeepaliveApp._show_error_dialog(
             "Teams Keep-Alive - Startup Error",
-            ("Failed to initialize the app.\n\n"
-             "Error: {}\n\n"
-             "Check the log file at:\n"
-             "  {}").format(exc, LOG_PATH_IN_USE)
-        )
+            ("Failed to initialize the app.\n\nError: {}\n\n"
+             "Check the log file at:\n  {}").format(exc, LOG_PATH_IN_USE))
         sys.exit(1)
 
     try:
@@ -1191,11 +1027,8 @@ def main() -> None:
         log.error("Fatal error in main loop: %s", exc, exc_info=True)
         KeepaliveApp._show_error_dialog(
             "Teams Keep-Alive - Fatal Error",
-            ("The app crashed:\n\n"
-             "Error: {}\n\n"
-             "Check the log file at:\n"
-             "  {}").format(exc, LOG_PATH_IN_USE)
-        )
+            ("The app crashed:\n\nError: {}\n\n"
+             "Check the log file at:\n  {}").format(exc, LOG_PATH_IN_USE))
         sys.exit(1)
 
 
