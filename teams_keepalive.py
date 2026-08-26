@@ -267,6 +267,7 @@ class InputController:
     def _win_is_locked() -> bool:
         try:
             import ctypes
+            import ctypes.wintypes
             DESKTOP_SWITCHDESKTOP = 0x0100
             hDesktop = ctypes.windll.user32.OpenInputDesktop(0, False, DESKTOP_SWITCHDESKTOP)
             if hDesktop:
@@ -300,6 +301,7 @@ class InputController:
     def _win_screensaver_running() -> bool:
         try:
             import ctypes
+            import ctypes.wintypes
             SPI_GETSCREENSAVERRUNNING = 114
             running = ctypes.wintypes.BOOL(False)
             ctypes.windll.user32.SystemParametersInfoW(
@@ -348,6 +350,7 @@ class InputController:
     @staticmethod
     def _win_jiggle_mouse() -> None:
         import ctypes
+        import ctypes.wintypes
         user32 = ctypes.windll.user32
         point = ctypes.wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(point))
@@ -531,6 +534,7 @@ class SettingsDialog:
 
     def show(self) -> None:
         """Build and show the settings dialog as a modal Toplevel."""
+        log.info("SettingsDialog.show(): building dialog")
         import tkinter as tk
         from tkinter import ttk
 
@@ -672,10 +676,12 @@ class SettingsDialog:
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="right", padx=4)
 
         # Center the dialog on screen
+        log.info("SettingsDialog.show(): centering on screen")
         dlg.update_idletasks()
         x = (dlg.winfo_screenwidth() - dlg.winfo_width()) // 2
         y = (dlg.winfo_screenheight() - dlg.winfo_height()) // 2
         dlg.geometry(f"+{x}+{y}")
+        log.info("SettingsDialog.show(): dialog ready, waiting for user interaction")
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +817,14 @@ class KeepaliveApp:
         def run_listener() -> None:
             try:
                 from pynput import keyboard
-                self._hotkey_listener = keyboard.GlobalHotKeyListener({
+                # pynput API changed in newer versions; try both import paths
+                ListenerClass = getattr(keyboard, 'GlobalHotKeyListener', None)
+                if ListenerClass is None:
+                    from pynput.keyboard import GlobalHotKeyListener as ListenerClass
+                self._hotkey_listener = ListenerClass({
                     HOTKEY_TOGGLE: lambda: self._on_hotkey()})
                 self._hotkey_listener.start()
+                log.info("Hotkey listener started (Ctrl+Shift+K)")
                 self._hotkey_listener.join()
             except Exception as exc:
                 log.warning("Hotkey listener failed: %s", exc)
@@ -947,15 +958,20 @@ class KeepaliveApp:
         tasks into self._ui_queue (a thread-safe queue.Queue); this method
         picks them up and runs them on the main thread where tkinter is safe.
         """
+        task_count = 0
         try:
             while True:
                 task = self._ui_queue.get_nowait()
+                task_count += 1
+                log.info("UI queue: executing task #%d", task_count)
                 try:
                     task()
                 except Exception as exc:
-                    log.warning("UI queue task error: %s", exc)
+                    log.error("UI queue task error: %s", exc, exc_info=True)
         except queue.Empty:
             pass
+        if task_count > 0:
+            log.info("UI queue: drained %d task(s)", task_count)
         # Re-schedule ourselves on the main thread (same thread = safe).
         if self.running.is_set() and self._root is not None:
             try:
@@ -965,6 +981,7 @@ class KeepaliveApp:
 
     # -- tray callbacks (run in pystray thread; put tasks into UI queue) ---
     def _on_cycle_interval(self, icon: Any, item: Any) -> None:
+        log.info("Tray callback: Cycle interval clicked")
         current = int(self.config.get("interval", 60))
         if current in INTERVAL_PRESETS:
             idx = INTERVAL_PRESETS.index(current)
@@ -976,16 +993,23 @@ class KeepaliveApp:
         self._rebuild_menu()
 
     def _on_toggle_pause(self, icon: Any, item: Any) -> None:
+        log.info("Tray callback: Pause/Resume clicked")
         self.toggle_pause(reason="manual")
         self._rebuild_menu()
 
     def _on_open_settings(self, icon: Any, item: Any) -> None:
         # Put the settings task into the queue; the main thread will pick it up.
+        log.info("Tray callback: Settings... clicked, queuing _show_settings")
         self._ui_queue.put(self._show_settings)
 
     def _show_settings(self) -> None:
         """Called on the main thread via _poll_ui_queue."""
-        SettingsDialog(self._root, self.config, on_change=self._on_settings_changed).show()
+        log.info("_show_settings: opening SettingsDialog on main thread")
+        try:
+            SettingsDialog(self._root, self.config, on_change=self._on_settings_changed).show()
+            log.info("_show_settings: SettingsDialog.show() completed")
+        except Exception as exc:
+            log.error("_show_settings: failed to open settings: %s", exc, exc_info=True)
 
     def _on_settings_changed(self) -> None:
         hotkey_enabled = bool(self.config.get("hotkey_enabled", True))
@@ -1002,6 +1026,7 @@ class KeepaliveApp:
 
     def _on_quit(self, icon: Any, item: Any) -> None:
         # Put the quit task into the queue; the main thread will pick it up.
+        log.info("Tray callback: Quit clicked, queuing _do_quit")
         self._ui_queue.put(self._do_quit)
 
     def _do_quit(self) -> None:
@@ -1010,6 +1035,7 @@ class KeepaliveApp:
         self._root.destroy()
 
     def _on_open_log(self, icon: Any, item: Any) -> None:
+        log.info("Tray callback: Open log file clicked")
         log_path = LOG_PATH_IN_USE if LOG_PATH_IN_USE else LOG_PATH
         if not os.path.exists(log_path):
             log.warning("Log file not found: %s", log_path)
